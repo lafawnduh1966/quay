@@ -14,7 +14,7 @@
 // `claim_lost`, `cancelled`, `wrong_state`, `unknown_task`, and
 // `budget_exhausted` without inspecting exception messages.
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import type { ArtifactStore } from "../artifacts/store.ts";
 import type { DB } from "../db/connection.ts";
 import type { Clock } from "../ports/clock.ts";
@@ -523,13 +523,25 @@ export function escalate_human(
   }
 
   const seq = row.next_escalation_seq;
-  const nonce = `quay-esc-${taskIdShort(input.taskId)}-${seq}-${deps.ids.next()}`;
+  // Spec §5: nonce is `quay-esc-<task_id_short>-<seq>-<random8>` (8-char
+  // hex from 4 random bytes; deps.ids supplies the suffix so tests stay
+  // deterministic).
+  const random8 = deps.ids.next().replace(/-/g, "").slice(0, 8).padEnd(8, "0");
+  const nonce = `quay-esc-${taskIdShort(input.taskId)}-${seq}-${random8}`;
+  // Spec §5: content_hash is computed over `question_body || seq || nonce`,
+  // so every escalation gets a distinct row even when the body repeats.
+  const escalationContentHash = createHash("sha256")
+    .update(input.questionBody)
+    .update(String(seq))
+    .update(nonce)
+    .digest("hex");
   const now = deps.clock.nowISO();
 
   // The artifact write (file + row) is done inside the SQL transaction so a
   // fence-failure ROLLBACK does not leak an artifact row. The on-disk file
-  // is allowed to linger; recovery-path content_hash idempotency makes a
-  // future retry collide on the existing row instead of duplicating.
+  // may linger after rollback; that's tolerated because subsequent retries
+  // mint a fresh nonce, so neither the file path nor the unique index ever
+  // collides with the abandoned write.
   let artifactId = -1;
   deps.db.exec("BEGIN IMMEDIATE");
   try {
@@ -538,7 +550,7 @@ export function escalate_human(
       attemptId: prior.attempt_id,
       kind: "slack_escalation_post",
       content: input.questionBody,
-      extension: "json",
+      extension: "txt",
     });
     artifactId = artifact.artifactId;
     deps.db
@@ -547,7 +559,7 @@ export function escalate_human(
             SET escalation_seq = ?, escalation_nonce = ?, content_hash = ?
           WHERE artifact_id = ?`,
       )
-      .run(seq, nonce, artifact.contentHash, artifact.artifactId);
+      .run(seq, nonce, escalationContentHash, artifact.artifactId);
 
     const upd = deps.db
       .query(
