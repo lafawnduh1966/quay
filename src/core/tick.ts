@@ -5,6 +5,7 @@ import type { Clock } from "../ports/clock.ts";
 import type { GitPort } from "../ports/git.ts";
 import type { GitHubPort } from "../ports/github.ts";
 import type { TmuxPort } from "../ports/tmux.ts";
+import { runCancelFinalizer } from "./cancel.ts";
 import {
   classifyAndApply,
   type ClassifyContextAttempt,
@@ -69,6 +70,7 @@ export type TickAction =
   | "ci_passed"
   | "claim_expired"
   | "orchestrator_loop_parked"
+  | "cancel_finalized"
   | "tick_error";
 
 export interface TickTaskResult {
@@ -136,14 +138,40 @@ export function tick_once(deps: TickDeps, options: TickOptions = {}): TickTaskRe
   return deps.supervisorLock.run(() => {
     const results: TickTaskResult[] = [];
 
+    // Top-of-loop cancel check (spec §5 + §14). Cancel intent is durable on
+    // the task row, so honor it from every non-terminal state — running,
+    // pr-open, done, awaiting-next-brief, claimed-by-orchestrator,
+    // waiting_human, parked. Per-state handling for these tasks is skipped
+    // this cycle; the finalizer drives them to `cancelled`.
+    const cancelTargets = readCancelTargets(deps.db);
+    const cancelledIds = new Set<string>();
+    for (const task of cancelTargets) {
+      try {
+        runCancelFinalizer(deps, task.task_id);
+        cancelledIds.add(task.task_id);
+        results.push({ task_id: task.task_id, action: "cancel_finalized" });
+      } catch (err) {
+        results.push(recordTickError(deps, task.task_id, err));
+        cancelledIds.add(task.task_id);
+      }
+    }
+
     // Snapshot active tasks once per tick (spec §5 "for each task in active
     // states"). Processing running first lets dead-worker classification run,
     // but tasks that transition through `queued` mid-tick are not promoted
     // until the next tick — the retry latency budget is one tick interval.
-    const runningSnapshot = readRunning(deps.db);
-    const prOpenSnapshot = readPrOpen(deps.db);
-    const claimedSnapshot = readClaimed(deps.db);
-    const queuedSnapshot = readQueued(deps.db);
+    const runningSnapshot = readRunning(deps.db).filter(
+      (t) => !cancelledIds.has(t.task_id),
+    );
+    const prOpenSnapshot = readPrOpen(deps.db).filter(
+      (t) => !cancelledIds.has(t.task_id),
+    );
+    const claimedSnapshot = readClaimed(deps.db).filter(
+      (t) => !cancelledIds.has(t.task_id),
+    );
+    const queuedSnapshot = readQueued(deps.db).filter(
+      (t) => !cancelledIds.has(t.task_id),
+    );
 
     for (const task of runningSnapshot) {
       try {
@@ -190,6 +218,21 @@ export function tick_once(deps: TickDeps, options: TickOptions = {}): TickTaskRe
 
     return results;
   });
+}
+
+interface CancelTargetRow {
+  task_id: string;
+}
+
+function readCancelTargets(db: DB): CancelTargetRow[] {
+  return db
+    .query<CancelTargetRow, []>(
+      `SELECT task_id FROM tasks
+        WHERE cancel_requested_at IS NOT NULL
+          AND state NOT IN ('cancelled', 'merged', 'closed_unmerged')
+        ORDER BY task_id`,
+    )
+    .all();
 }
 
 function readQueued(db: DB): QueuedTaskRow[] {

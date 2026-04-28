@@ -6,6 +6,13 @@
 export interface GitHubPort {
   prExistsForBranch(repoId: string, branch: string): boolean;
   prCheckStatus(repoId: string, branch: string): PrCheckStatus;
+  // Slice 7: returns true iff a PR for the branch is currently open. Used by
+  // the cancel finalizer to decide whether to retain the remote branch in the
+  // default cleanup matrix.
+  prIsOpen(repoId: string, branch: string): boolean;
+  // Slice 7: idempotent `gh pr close` for the named branch. Real adapter
+  // tolerates "PR already closed" and "no PR for branch" without erroring.
+  closePr(repoId: string, branch: string): void;
 }
 
 export type PrCheckState = "pass" | "fail" | "pending";

@@ -18,4 +18,7 @@ export interface GitPort {
   // Slice 3: returns the SHA at origin/<branch> in the bare clone after a
   // fetch, or null if the remote ref does not exist.
   remoteHeadSha(repoId: string, branch: string): string | null;
+  // Slice 7: idempotent `git push origin --delete <branch>`. Real adapter
+  // tolerates "remote ref does not exist" and any other non-fatal error.
+  deleteRemoteBranch(repoId: string, branch: string): void;
 }

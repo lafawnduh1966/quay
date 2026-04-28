@@ -112,6 +112,12 @@ export class FakeGit implements GitPort {
     this.localBranches.get(repoId)?.delete(branch);
   }
 
+  deleteRemoteBranch(repoId: string, branch: string): void {
+    this.record("deleteRemoteBranch", { repoId, branch });
+    // Idempotent — missing remote ref is not an error.
+    this.remoteBranches.get(repoId)?.delete(branch);
+  }
+
   removeBareClone(repoId: string): void {
     this.record("removeBareClone", { repoId });
     rmSync(this.bareDir(repoId), { recursive: true, force: true });
