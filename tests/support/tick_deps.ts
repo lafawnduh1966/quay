@@ -33,6 +33,7 @@ export function buildTickDeps(h: Harness): BuiltTickDeps {
       git,
       github,
       tmux,
+      artifactStore,
       supervisorLock: new InProcessSupervisorLock(),
     },
     git,
