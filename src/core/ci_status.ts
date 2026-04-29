@@ -23,20 +23,18 @@ export function classifyCi(
     const filtered = snapshot.checks.items.filter(
       (c) => c.workflow === ciWorkflowName,
     );
-    return classifySet(filtered, /*requiredFilter=*/ false);
+    return classifySet(filtered);
   }
 
   // ci_workflow_name unset: required-checks rule. The set of checks Quay
   // considers is `--required` only. No required checks at all → pass.
   const required = snapshot.checks.items.filter((c) => c.required);
   if (required.length === 0) return "pass";
-  return classifySet(required, /*requiredFilter=*/ true);
+  return classifySet(required);
 }
 
-function classifySet(items: PrCheck[], requiredFilter: boolean): CiOutcome {
+function classifySet(items: PrCheck[]): CiOutcome {
   if (items.length === 0) return "pending";
-  // `cancelled` required checks count as `fail`; non-required cancelled checks
-  // are filtered out before reaching here.
   let hasFail = false;
   let hasPending = false;
   for (const c of items) {
@@ -45,9 +43,7 @@ function classifySet(items: PrCheck[], requiredFilter: boolean): CiOutcome {
       continue;
     }
     if (c.bucket === "cancelled") {
-      // Always fail in the named-workflow set; in the required-only set we
-      // already filtered to `required = true`, so cancelled here is fail too.
-      hasFail = true;
+      if (c.required) hasFail = true;
       continue;
     }
     if (c.bucket === "pending") {

@@ -546,6 +546,7 @@ function processPrOpenTask(
     );
   }
   if (ci === "pending") {
+    clearTickError(deps, task.task_id);
     return { task_id: task.task_id, action: "ci_pending" };
   }
   if (ci === "pass") {
@@ -611,6 +612,7 @@ function processDoneTask(
     );
   }
 
+  clearTickError(deps, task.task_id);
   return null;
 }
 

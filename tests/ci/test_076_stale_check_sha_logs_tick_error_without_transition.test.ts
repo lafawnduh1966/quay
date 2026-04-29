@@ -76,4 +76,27 @@ test("test_076_stale_check_sha_logs_tick_error_without_transition", () => {
     )
     .get(taskId);
   expect(tickErrorEvents?.n).toBe(1);
+
+  built.github.setPrSnapshot(repoId, `quay/${taskId}`, {
+    state: "open",
+    headSha: "new-head",
+    baseSha: "base-sha",
+    mergeable: "mergeable",
+    latestReview: { decision: "NONE", latestReviewId: null, comments: "" },
+    checks: {
+      checkSha: "new-head",
+      items: [
+        { name: "build", workflow: null, bucket: "pending", required: true },
+      ],
+    },
+  });
+
+  const retryResults = tick_once(built.deps);
+  expect(retryResults).toEqual([{ task_id: taskId, action: "ci_pending" }]);
+  const recovered = h.db
+    .query<{ tick_error: string | null }, [string]>(
+      `SELECT tick_error FROM tasks WHERE task_id = ?`,
+    )
+    .get(taskId);
+  expect(recovered?.tick_error).toBeNull();
 });

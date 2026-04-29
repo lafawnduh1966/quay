@@ -34,7 +34,8 @@ test("test_048_nonbudget_review_dedupe_does_not_respawn_same_review", () => {
       `UPDATE tasks
           SET last_review_id_acted_on = ?,
               non_budget_respawns_consumed = 1,
-              attempts_consumed = 1
+              attempts_consumed = 1,
+              tick_error = 'previous transient GitHub read failed'
         WHERE task_id = ?`,
     )
     .run("review-7", taskId);
@@ -70,11 +71,12 @@ test("test_048_nonbudget_review_dedupe_does_not_respawn_same_review", () => {
         last_review_id_acted_on: string | null;
         non_budget_respawns_consumed: number;
         attempts_consumed: number;
+        tick_error: string | null;
       },
       [string]
     >(
       `SELECT state, last_review_id_acted_on, non_budget_respawns_consumed,
-              attempts_consumed
+              attempts_consumed, tick_error
          FROM tasks WHERE task_id = ?`,
     )
     .get(taskId);
@@ -83,6 +85,7 @@ test("test_048_nonbudget_review_dedupe_does_not_respawn_same_review", () => {
     last_review_id_acted_on: "review-7",
     non_budget_respawns_consumed: 1, // not incremented again
     attempts_consumed: 1,
+    tick_error: null,
   });
 
   // No new pending attempt scheduled.

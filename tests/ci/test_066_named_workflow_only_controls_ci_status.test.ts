@@ -56,6 +56,7 @@ test("test_066_named_workflow_only_controls_ci_status", () => {
       items: [
         { name: "build", workflow: "ci.yml", bucket: "pass", required: true },
         { name: "lint", workflow: "ci.yml", bucket: "pass", required: true },
+        { name: "preview", workflow: "ci.yml", bucket: "cancelled", required: false },
         // Unrelated workflow fails — should be ignored.
         { name: "deploy", workflow: "deploy.yml", bucket: "fail", required: false },
         { name: "preview", workflow: "preview.yml", bucket: "fail", required: false },

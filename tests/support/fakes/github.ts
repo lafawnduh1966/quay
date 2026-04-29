@@ -10,8 +10,8 @@ export class FakeGitHub implements GitHubPort {
   readonly prExisting = new Map<string, boolean>(); // key = `${repoId}\0${branch}`
   readonly prOpen = new Map<string, boolean>();
   readonly checkStatuses = new Map<string, PrCheckStatus>();
-  // Explicit per-(repo, branch) PR snapshots set by slice 9+ tests. When set,
-  // takes precedence over the legacy `setPrCheckStatus`-derived synthesis.
+  // Explicit per-(repo, branch) PR snapshots take precedence over the legacy
+  // `setPrCheckStatus`-derived synthesis.
   readonly snapshots = new Map<string, PrSnapshot | null>();
 
   prExistsForBranch(repoId: string, branch: string): boolean {
