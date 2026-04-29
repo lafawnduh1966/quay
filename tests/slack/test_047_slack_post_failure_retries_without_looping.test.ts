@@ -122,4 +122,5 @@ test("test_047_slack_post_failure_retries_without_looping", () => {
     )
     .get(taskId);
   expect(finalTask!.state).toBe("waiting_human");
+  expect(finalTask!.tick_error).toBeNull();
 });

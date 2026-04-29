@@ -690,6 +690,7 @@ function processWaitingHumanTask(
         deps.db.exec("COMMIT");
         art.slack_recovered_post_ts = match.ts;
         if (art.slack_post_ts === null) art.slack_post_ts = match.ts;
+        clearTickError(deps, task.task_id);
         results.push({ task_id: task.task_id, action: "slack_post_recovered" });
         fireFailpoint("after_slack_recovery_ts_commit");
       } catch (err) {
@@ -740,6 +741,7 @@ function processWaitingHumanTask(
       deps.db.exec("COMMIT");
       art.slack_post_ts = postTs;
       art.slack_recovered_post_ts = postTs;
+      clearTickError(deps, task.task_id);
       results.push({ task_id: task.task_id, action: "slack_posted" });
     } catch (err) {
       try {
@@ -765,6 +767,7 @@ function processWaitingHumanTask(
     (r) => !r.authorBot && Number(r.ts) > lb,
   );
   if (!firstNonBot) {
+    clearTickError(deps, task.task_id);
     if (results.length === 0) results.push({ task_id: task.task_id, action: "slack_skipped" });
     return results;
   }
@@ -1202,6 +1205,18 @@ function recordTickError(deps: TickDeps, taskId: string, err: unknown): TickTask
     } catch {}
   }
   return { task_id: taskId, action: "tick_error", error: message };
+}
+
+function clearTickError(deps: TickDeps, taskId: string): void {
+  deps.db
+    .query(
+      `UPDATE tasks
+          SET tick_error = NULL,
+              updated_at = ?
+        WHERE task_id = ?
+          AND tick_error IS NOT NULL`,
+    )
+    .run(deps.clock.nowISO(), taskId);
 }
 
 interface PromotionInput {
