@@ -1,10 +1,10 @@
 import { createHash } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import type { ArtifactStore } from "../artifacts/store.ts";
 import type { DB } from "../db/connection.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { GitPort } from "../ports/git.ts";
-import type { GitHubPort } from "../ports/github.ts";
+import type { GitHubPort, PrSnapshot } from "../ports/github.ts";
 import type { SlackPort } from "../ports/slack.ts";
 import type { TmuxPort } from "../ports/tmux.ts";
 import { runCancelFinalizer } from "./cancel.ts";
@@ -14,7 +14,9 @@ import {
   type ClassifyContextTask,
   type ClassifyOutcome,
 } from "./classifier.ts";
+import { classifyCi } from "./ci_status.ts";
 import { fireFailpoint } from "./failpoints.ts";
+import { scheduleNonBudgetRespawn } from "./non_budget_respawn.ts";
 import {
   scheduleCleanSpawnRetry,
   scheduleDeterministicRetry,
@@ -28,6 +30,7 @@ export const DEFAULT_STALENESS_THRESHOLD_SECONDS = 600;
 export const DEFAULT_MAX_SPAWN_FAILURES = 3;
 export const DEFAULT_CLAIM_TIMEOUT_SECONDS = 1800;
 export const DEFAULT_MAX_CLAIM_EXPIRATIONS = 3;
+export const DEFAULT_MAX_NON_BUDGET_RESPAWNS = 20;
 export const DEFAULT_AGENT_INVOCATION =
   "claude --permission-mode bypassPermissions < {prompt_file}";
 
@@ -50,6 +53,7 @@ export interface TickOptions {
   maxSpawnFailures?: number;
   claimTimeoutSeconds?: number;
   maxClaimExpirations?: number;
+  maxNonBudgetRespawns?: number;
 }
 
 export type TickAction =
@@ -71,6 +75,11 @@ export type TickAction =
   | "ci_failed"
   | "ci_pending"
   | "ci_passed"
+  | "pr_merged"
+  | "pr_closed_unmerged"
+  | "review_respawn_scheduled"
+  | "conflict_respawn_scheduled"
+  | "non_budget_loop_parked"
   | "claim_expired"
   | "orchestrator_loop_parked"
   | "cancel_finalized"
@@ -109,7 +118,20 @@ interface PrOpenTaskRow {
   task_id: string;
   repo_id: string;
   branch_name: string;
+  worktree_path: string;
   cancel_requested_at: string | null;
+  last_review_id_acted_on: string | null;
+  last_conflict_observation: string | null;
+}
+
+interface DoneTaskRow {
+  task_id: string;
+  repo_id: string;
+  branch_name: string;
+  worktree_path: string;
+  cancel_requested_at: string | null;
+  last_review_id_acted_on: string | null;
+  last_conflict_observation: string | null;
 }
 
 interface ClaimedTaskRow {
@@ -174,6 +196,9 @@ export function tick_once(deps: TickDeps, options: TickOptions = {}): TickTaskRe
     const prOpenSnapshot = readPrOpen(deps.db).filter(
       (t) => !cancelledIds.has(t.task_id),
     );
+    const doneSnapshot = readDone(deps.db).filter(
+      (t) => !cancelledIds.has(t.task_id),
+    );
     const claimedSnapshot = readClaimed(deps.db).filter(
       (t) => !cancelledIds.has(t.task_id),
     );
@@ -195,7 +220,16 @@ export function tick_once(deps: TickDeps, options: TickOptions = {}): TickTaskRe
 
     for (const task of prOpenSnapshot) {
       try {
-        const result = processPrOpenTask(deps, task);
+        const result = processPrOpenTask(deps, task, options);
+        if (result !== null) results.push(result);
+      } catch (err) {
+        results.push(recordTickError(deps, task.task_id, err));
+      }
+    }
+
+    for (const task of doneSnapshot) {
+      try {
+        const result = processDoneTask(deps, task, options);
         if (result !== null) results.push(result);
       } catch (err) {
         results.push(recordTickError(deps, task.task_id, err));
@@ -308,9 +342,24 @@ function readWaitingHuman(db: DB): WaitingHumanTaskRow[] {
 function readPrOpen(db: DB): PrOpenTaskRow[] {
   return db
     .query<PrOpenTaskRow, []>(
-      `SELECT task_id, repo_id, branch_name, cancel_requested_at
+      `SELECT task_id, repo_id, branch_name, worktree_path,
+              cancel_requested_at, last_review_id_acted_on,
+              last_conflict_observation
          FROM tasks
         WHERE state = 'pr-open'
+        ORDER BY created_at, task_id`,
+    )
+    .all();
+}
+
+function readDone(db: DB): DoneTaskRow[] {
+  return db
+    .query<DoneTaskRow, []>(
+      `SELECT task_id, repo_id, branch_name, worktree_path,
+              cancel_requested_at, last_review_id_acted_on,
+              last_conflict_observation
+         FROM tasks
+        WHERE state = 'done'
         ORDER BY created_at, task_id`,
     )
     .all();
@@ -441,64 +490,285 @@ function outcomeToResult(
 function processPrOpenTask(
   deps: TickDeps,
   task: PrOpenTaskRow,
+  options: TickOptions,
 ): TickTaskResult | null {
   if (task.cancel_requested_at !== null) return null;
   const attempt = loadLatestAttempt(deps.db, task.task_id);
   if (!attempt) return null;
 
-  const status = deps.github.prCheckStatus(task.repo_id, task.branch_name);
-  if (status.state === "pending") {
-    return { task_id: task.task_id, action: "ci_pending" };
+  const snapshot = deps.github.prSnapshot(task.repo_id, task.branch_name);
+  if (snapshot === null) {
+    return recordTickError(
+      deps,
+      task.task_id,
+      new Error(
+        `PR snapshot unavailable for branch ${task.branch_name}; tick will retry next cycle`,
+      ),
+    );
   }
 
-  const now = deps.clock.nowISO();
-  if (status.state === "pass") {
-    deps.db.exec("BEGIN");
-    try {
-      const upd = deps.db
-        .query(
-          `UPDATE tasks
-              SET state = 'done', tick_error = NULL, updated_at = ?
-            WHERE task_id = ? AND state = 'pr-open'
-              AND cancel_requested_at IS NULL`,
-        )
-        .run(now, task.task_id);
-      const changes = (upd as { changes?: number }).changes ?? 0;
-      if (changes === 0) {
-        deps.db.exec("ROLLBACK");
-        return null;
-      }
-      deps.db
-        .query(
-          `INSERT INTO events (
-             task_id, attempt_id, event_type, from_state, to_state, occurred_at
-           ) VALUES (?, ?, 'ci_passed', 'pr-open', 'done', ?)`,
-        )
-        .run(task.task_id, attempt.attempt_id, now);
-      deps.db.exec("COMMIT");
-      return { task_id: task.task_id, action: "ci_passed" };
-    } catch (err) {
-      try {
-        deps.db.exec("ROLLBACK");
-      } catch {}
-      throw err;
+  // 1. Terminal PR state (merged / closed_unmerged) takes precedence over
+  //    everything else — even pending CI. A human merging or closing the PR
+  //    while CI is still running must convert to terminal cleanly (spec §5
+  //    "pr-open polls PR state").
+  if (snapshot.state === "merged" || snapshot.state === "closed_unmerged") {
+    return finalizePrTerminal(deps, task, attempt, snapshot.state, "pr-open");
+  }
+
+  // 2. Merge conflict: schedule a non-budget conflict respawn unless the
+  //    (head_sha:base_sha) pair matches the dedupe key.
+  if (snapshot.mergeable === "conflicting") {
+    const observation = formatConflictObservation(snapshot);
+    if (task.last_conflict_observation !== observation) {
+      return scheduleConflictNonBudget(
+        deps,
+        task.task_id,
+        attempt,
+        snapshot,
+        observation,
+        "pr-open",
+        options,
+      );
     }
   }
 
+  // 3. CI status (named workflow vs required vs no-checks).
+  const repo = loadRepoForTask(deps.db, task.task_id);
+  const ci = classifyCi(snapshot, repo?.ci_workflow_name ?? null);
+
+  if (ci === "stale") {
+    return recordTickError(
+      deps,
+      task.task_id,
+      new Error(
+        `PR head SHA (${snapshot.headSha}) and check-run SHA (${snapshot.checks.checkSha}) disagree; skipping CI evaluation this tick`,
+      ),
+    );
+  }
+  if (ci === "pending") {
+    return { task_id: task.task_id, action: "ci_pending" };
+  }
+  if (ci === "pass") {
+    return transitionCiPassed(deps, task, attempt);
+  }
+  return scheduleCiFailRetry(deps, task, attempt, snapshot);
+}
+
+function processDoneTask(
+  deps: TickDeps,
+  task: DoneTaskRow,
+  options: TickOptions,
+): TickTaskResult | null {
+  if (task.cancel_requested_at !== null) return null;
+  const attempt = loadLatestAttempt(deps.db, task.task_id);
+  if (!attempt) return null;
+
+  const snapshot = deps.github.prSnapshot(task.repo_id, task.branch_name);
+  if (snapshot === null) {
+    return recordTickError(
+      deps,
+      task.task_id,
+      new Error(
+        `PR snapshot unavailable for branch ${task.branch_name}; tick will retry next cycle`,
+      ),
+    );
+  }
+
+  // 1. Terminal PR state.
+  if (snapshot.state === "merged" || snapshot.state === "closed_unmerged") {
+    return finalizePrTerminal(deps, task, attempt, snapshot.state, "done");
+  }
+
+  // 2. Merge conflict.
+  if (snapshot.mergeable === "conflicting") {
+    const observation = formatConflictObservation(snapshot);
+    if (task.last_conflict_observation !== observation) {
+      return scheduleConflictNonBudget(
+        deps,
+        task.task_id,
+        attempt,
+        snapshot,
+        observation,
+        "done",
+        options,
+      );
+    }
+  }
+
+  // 3. Review feedback.
+  if (
+    snapshot.latestReview.decision === "CHANGES_REQUESTED" &&
+    snapshot.latestReview.latestReviewId !== null &&
+    task.last_review_id_acted_on !== snapshot.latestReview.latestReviewId
+  ) {
+    return scheduleReviewNonBudget(
+      deps,
+      task.task_id,
+      attempt,
+      snapshot,
+      "done",
+      options,
+    );
+  }
+
+  return null;
+}
+
+interface PrTerminalRow {
+  task_id: string;
+  repo_id: string;
+  branch_name: string;
+  worktree_path: string;
+}
+
+function finalizePrTerminal(
+  deps: TickDeps,
+  task: PrTerminalRow,
+  attempt: CurrentAttemptRow,
+  terminal: "merged" | "closed_unmerged",
+  fromState: "pr-open" | "done",
+): TickTaskResult {
+  const now = deps.clock.nowISO();
+
+  // Step 1: branch + worktree cleanup per the §5 cleanup matrix.
+  applyTerminalCleanup(deps, task, terminal);
+
+  // Step 2: atomic SQL terminal transition.
+  deps.db.exec("BEGIN IMMEDIATE");
+  try {
+    const upd = deps.db
+      .query(
+        `UPDATE tasks
+            SET state = ?, tick_error = NULL, updated_at = ?
+          WHERE task_id = ? AND state = ?
+            AND cancel_requested_at IS NULL`,
+      )
+      .run(terminal, now, task.task_id, fromState);
+    const changes = (upd as { changes?: number }).changes ?? 0;
+    if (changes === 0) {
+      deps.db.exec("ROLLBACK");
+      return { task_id: task.task_id, action: "skipped_predicate" };
+    }
+    // Stamp `pr_merged` / `pr_closed_unmerged` exit_kind on the latest attempt
+    // when it has no terminal exit yet (e.g. CI was still pending — the
+    // attempt itself didn't reach a clean done state, so the latest exit_kind
+    // is whatever was set when the worker died, typically `pr_opened`).
+    // We only update when ended_at IS NULL to preserve the historical exit.
+    if (attempt.spawned_at !== null) {
+      deps.db
+        .query(
+          `UPDATE attempts SET ended_at = ? WHERE attempt_id = ? AND ended_at IS NULL`,
+        )
+        .run(now, attempt.attempt_id);
+    }
+    const eventType = terminal === "merged" ? "merged" : "closed";
+    deps.db
+      .query(
+        `INSERT INTO events (
+           task_id, attempt_id, event_type, from_state, to_state, occurred_at
+         ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(task.task_id, attempt.attempt_id, eventType, fromState, terminal, now);
+    deps.db.exec("COMMIT");
+  } catch (err) {
+    try {
+      deps.db.exec("ROLLBACK");
+    } catch {}
+    throw err;
+  }
+
+  return {
+    task_id: task.task_id,
+    action: terminal === "merged" ? "pr_merged" : "pr_closed_unmerged",
+  };
+}
+
+function applyTerminalCleanup(
+  deps: TickDeps,
+  task: PrTerminalRow,
+  terminal: "merged" | "closed_unmerged",
+): void {
+  // Worktree removal (best-effort) per §5 cleanup matrix.
+  try {
+    if (existsSync(task.worktree_path)) {
+      deps.git.worktreeRemove(task.worktree_path);
+    }
+  } catch {}
+
+  // Local branch is deleted in both terminals.
+  try {
+    deps.git.branchDelete(task.repo_id, task.branch_name);
+  } catch {}
+
+  // Remote branch: delete only on closed_unmerged (the human chose to discard
+  // the work). On merged, GitHub's "delete branch on merge" handles it.
+  if (terminal === "closed_unmerged") {
+    try {
+      deps.git.deleteRemoteBranch(task.repo_id, task.branch_name);
+    } catch {}
+  }
+}
+
+function transitionCiPassed(
+  deps: TickDeps,
+  task: PrOpenTaskRow,
+  attempt: CurrentAttemptRow,
+): TickTaskResult | null {
+  const now = deps.clock.nowISO();
+  deps.db.exec("BEGIN");
+  try {
+    const upd = deps.db
+      .query(
+        `UPDATE tasks
+            SET state = 'done', tick_error = NULL, updated_at = ?
+          WHERE task_id = ? AND state = 'pr-open'
+            AND cancel_requested_at IS NULL`,
+      )
+      .run(now, task.task_id);
+    const changes = (upd as { changes?: number }).changes ?? 0;
+    if (changes === 0) {
+      deps.db.exec("ROLLBACK");
+      return null;
+    }
+    deps.db
+      .query(
+        `INSERT INTO events (
+           task_id, attempt_id, event_type, from_state, to_state, occurred_at
+         ) VALUES (?, ?, 'ci_passed', 'pr-open', 'done', ?)`,
+      )
+      .run(task.task_id, attempt.attempt_id, now);
+    deps.db.exec("COMMIT");
+    return { task_id: task.task_id, action: "ci_passed" };
+  } catch (err) {
+    try {
+      deps.db.exec("ROLLBACK");
+    } catch {}
+    throw err;
+  }
+}
+
+function scheduleCiFailRetry(
+  deps: TickDeps,
+  task: PrOpenTaskRow,
+  attempt: CurrentAttemptRow,
+  snapshot: PrSnapshot,
+): TickTaskResult {
+  const now = deps.clock.nowISO();
+  const failureExcerpt = composeCiFailureExcerpt(snapshot);
   deps.db.exec("BEGIN");
   try {
     const excerpt = deps.artifactStore.writeArtifact({
       taskId: task.task_id,
       attemptId: attempt.attempt_id,
       kind: "ci_failure_excerpt",
-      content: status.excerpt ?? "CI failed.",
+      content: failureExcerpt,
       extension: "txt",
     });
     scheduleDeterministicRetry(deps, {
       taskId: task.task_id,
       prevAttempt: attempt,
       reason: "ci_fail",
-      diagnostics: status.excerpt ?? "CI failed.",
+      diagnostics: failureExcerpt,
       fromState: "pr-open",
     });
     deps.db
@@ -508,7 +778,13 @@ function processPrOpenTask(
            payload_artifact_id, occurred_at
          ) VALUES (?, ?, 'ci_failed', 'pr-open', (SELECT state FROM tasks WHERE task_id = ?), ?, ?)`,
       )
-      .run(task.task_id, attempt.attempt_id, task.task_id, excerpt.artifactId, now);
+      .run(
+        task.task_id,
+        attempt.attempt_id,
+        task.task_id,
+        excerpt.artifactId,
+        now,
+      );
     deps.db.exec("COMMIT");
     return { task_id: task.task_id, action: "ci_failed" };
   } catch (err) {
@@ -517,6 +793,109 @@ function processPrOpenTask(
     } catch {}
     throw err;
   }
+}
+
+function composeCiFailureExcerpt(snapshot: PrSnapshot): string {
+  if (snapshot.checks.failureExcerpt) return snapshot.checks.failureExcerpt;
+  const fails = snapshot.checks.items
+    .filter((c) => c.bucket === "fail" || c.bucket === "cancelled")
+    .map((c) => `${c.workflow ?? "<no-workflow>"}/${c.name} = ${c.bucket}`);
+  if (fails.length === 0) return "CI failed.";
+  return ["CI failed:", ...fails.map((s) => `  - ${s}`)].join("\n");
+}
+
+function scheduleConflictNonBudget(
+  deps: TickDeps,
+  taskId: string,
+  attempt: CurrentAttemptRow,
+  snapshot: PrSnapshot,
+  observation: string,
+  fromState: "pr-open" | "done",
+  options: TickOptions,
+): TickTaskResult {
+  const cap = options.maxNonBudgetRespawns ?? DEFAULT_MAX_NON_BUDGET_RESPAWNS;
+  const sliceContent = JSON.stringify({
+    head_sha: snapshot.headSha,
+    base_sha: snapshot.baseSha,
+    mergeable: snapshot.mergeable,
+  });
+  const result = scheduleNonBudgetRespawn(deps, {
+    taskId,
+    prevAttempt: attempt,
+    reason: "conflict",
+    diagnostics: `GitHub reports mergeable=${snapshot.mergeable} for head=${snapshot.headSha} base=${snapshot.baseSha ?? "<unknown>"}.`,
+    fromState,
+    snapshotKind: "conflict_slice",
+    snapshotContent: sliceContent,
+    snapshotExtension: "json",
+    dedupeColumn: "last_conflict_observation",
+    dedupeValue: observation,
+    maxNonBudgetRespawns: cap,
+  });
+  if (result.outcome === "parked") {
+    return { task_id: taskId, action: "non_budget_loop_parked" };
+  }
+  if (result.outcome === "scheduled") {
+    return { task_id: taskId, action: "conflict_respawn_scheduled" };
+  }
+  return { task_id: taskId, action: "skipped_predicate" };
+}
+
+function scheduleReviewNonBudget(
+  deps: TickDeps,
+  taskId: string,
+  attempt: CurrentAttemptRow,
+  snapshot: PrSnapshot,
+  fromState: "done",
+  options: TickOptions,
+): TickTaskResult {
+  const cap = options.maxNonBudgetRespawns ?? DEFAULT_MAX_NON_BUDGET_RESPAWNS;
+  const reviewId = snapshot.latestReview.latestReviewId!;
+  const commentsContent = JSON.stringify({
+    review_id: reviewId,
+    decision: snapshot.latestReview.decision,
+    comments: snapshot.latestReview.comments,
+  });
+  const result = scheduleNonBudgetRespawn(deps, {
+    taskId,
+    prevAttempt: attempt,
+    reason: "review",
+    diagnostics: `Reviewer marked CHANGES_REQUESTED in review ${reviewId}.`,
+    fromState,
+    snapshotKind: "review_comments",
+    snapshotContent: commentsContent,
+    snapshotExtension: "json",
+    dedupeColumn: "last_review_id_acted_on",
+    dedupeValue: reviewId,
+    maxNonBudgetRespawns: cap,
+  });
+  if (result.outcome === "parked") {
+    return { task_id: taskId, action: "non_budget_loop_parked" };
+  }
+  if (result.outcome === "scheduled") {
+    return { task_id: taskId, action: "review_respawn_scheduled" };
+  }
+  return { task_id: taskId, action: "skipped_predicate" };
+}
+
+function formatConflictObservation(snapshot: PrSnapshot): string {
+  const base = snapshot.baseSha ?? "";
+  return `${snapshot.headSha}:${base}`;
+}
+
+function loadRepoForTask(
+  db: DB,
+  taskId: string,
+): { ci_workflow_name: string | null } | null {
+  return (
+    db
+      .query<{ ci_workflow_name: string | null }, [string]>(
+        `SELECT r.ci_workflow_name AS ci_workflow_name
+           FROM tasks t JOIN repos r ON r.repo_id = t.repo_id
+          WHERE t.task_id = ?`,
+      )
+      .get(taskId) ?? null
+  );
 }
 
 function processClaimedTask(
