@@ -5,6 +5,7 @@ import { InProcessSupervisorLock } from "../../src/core/supervisor_lock.ts";
 import type { Harness } from "./harness.ts";
 import { FakeGit } from "./fakes/git.ts";
 import { FakeGitHub } from "./fakes/github.ts";
+import { FakeSlack } from "./fakes/slack.ts";
 import { FakeTmux } from "./fakes/tmux.ts";
 
 export interface BuiltTickDeps {
@@ -12,6 +13,7 @@ export interface BuiltTickDeps {
   git: FakeGit;
   github: FakeGitHub;
   tmux: FakeTmux;
+  slack: FakeSlack;
   reposRoot: string;
   artifactStore: ReturnType<typeof createArtifactStore>;
 }
@@ -21,6 +23,7 @@ export function buildTickDeps(h: Harness): BuiltTickDeps {
   const git = new FakeGit(reposRoot);
   const github = new FakeGitHub();
   const tmux = new FakeTmux();
+  const slack = new FakeSlack();
   const artifactStore = createArtifactStore({
     db: h.db,
     artifactRoot: h.artifactRoot,
@@ -33,12 +36,14 @@ export function buildTickDeps(h: Harness): BuiltTickDeps {
       git,
       github,
       tmux,
+      slack,
       artifactStore,
       supervisorLock: new InProcessSupervisorLock(),
     },
     git,
     github,
     tmux,
+    slack,
     reposRoot,
     artifactStore,
   };

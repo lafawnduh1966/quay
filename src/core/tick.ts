@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import type { ArtifactStore } from "../artifacts/store.ts";
 import type { DB } from "../db/connection.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { GitPort } from "../ports/git.ts";
 import type { GitHubPort } from "../ports/github.ts";
+import type { SlackPort } from "../ports/slack.ts";
 import type { TmuxPort } from "../ports/tmux.ts";
 import { runCancelFinalizer } from "./cancel.ts";
 import {
@@ -35,6 +37,7 @@ export interface TickDeps {
   git: GitPort;
   github: GitHubPort;
   tmux: TmuxPort;
+  slack: SlackPort;
   artifactStore: ArtifactStore;
   supervisorLock: SupervisorLock;
 }
@@ -71,6 +74,11 @@ export type TickAction =
   | "claim_expired"
   | "orchestrator_loop_parked"
   | "cancel_finalized"
+  | "slack_fence_captured"
+  | "slack_post_recovered"
+  | "slack_posted"
+  | "slack_reply_ingested"
+  | "slack_skipped"
   | "tick_error";
 
 export interface TickTaskResult {
@@ -169,6 +177,9 @@ export function tick_once(deps: TickDeps, options: TickOptions = {}): TickTaskRe
     const claimedSnapshot = readClaimed(deps.db).filter(
       (t) => !cancelledIds.has(t.task_id),
     );
+    const waitingHumanSnapshot = readWaitingHuman(deps.db).filter(
+      (t) => !cancelledIds.has(t.task_id),
+    );
     const queuedSnapshot = readQueued(deps.db).filter(
       (t) => !cancelledIds.has(t.task_id),
     );
@@ -195,6 +206,15 @@ export function tick_once(deps: TickDeps, options: TickOptions = {}): TickTaskRe
       try {
         const result = processClaimedTask(deps, task, options);
         if (result !== null) results.push(result);
+      } catch (err) {
+        results.push(recordTickError(deps, task.task_id, err));
+      }
+    }
+
+    for (const task of waitingHumanSnapshot) {
+      try {
+        const taskResults = processWaitingHumanTask(deps, task);
+        for (const r of taskResults) results.push(r);
       } catch (err) {
         results.push(recordTickError(deps, task.task_id, err));
       }
@@ -264,6 +284,23 @@ function readClaimed(db: DB): ClaimedTaskRow[] {
          FROM tasks
         WHERE state = 'claimed-by-orchestrator'
         ORDER BY claimed_at, task_id`,
+    )
+    .all();
+}
+
+interface WaitingHumanTaskRow {
+  task_id: string;
+  slack_thread_ref: string | null;
+  cancel_requested_at: string | null;
+}
+
+function readWaitingHuman(db: DB): WaitingHumanTaskRow[] {
+  return db
+    .query<WaitingHumanTaskRow, []>(
+      `SELECT task_id, slack_thread_ref, cancel_requested_at
+         FROM tasks
+        WHERE state = 'waiting_human'
+        ORDER BY created_at, task_id`,
     )
     .all();
 }
@@ -554,6 +591,275 @@ function processClaimedTask(
     task_id: task.task_id,
     action: parking ? "orchestrator_loop_parked" : "claim_expired",
   };
+}
+
+interface EscalationArtifactRow {
+  artifact_id: number;
+  attempt_id: number | null;
+  task_id: string;
+  escalation_seq: number | null;
+  escalation_nonce: string | null;
+  content_hash: string | null;
+  slack_pre_post_fence_ts: string | null;
+  slack_post_ts: string | null;
+  slack_recovered_post_ts: string | null;
+  file_path: string;
+}
+
+function loadLatestEscalationArtifact(
+  db: DB,
+  taskId: string,
+): EscalationArtifactRow | null {
+  return (
+    db
+      .query<EscalationArtifactRow, [string]>(
+        `SELECT artifact_id, attempt_id, task_id, escalation_seq,
+                escalation_nonce, content_hash, slack_pre_post_fence_ts,
+                slack_post_ts, slack_recovered_post_ts, file_path
+           FROM artifacts
+          WHERE task_id = ? AND kind = 'slack_escalation_post'
+          ORDER BY artifact_id DESC LIMIT 1`,
+      )
+      .get(taskId) ?? null
+  );
+}
+
+function processWaitingHumanTask(
+  deps: TickDeps,
+  task: WaitingHumanTaskRow,
+): TickTaskResult[] {
+  if (task.cancel_requested_at !== null) return [];
+  if (task.slack_thread_ref === null) {
+    // No thread to post into; nothing to do.
+    return [];
+  }
+
+  const art = loadLatestEscalationArtifact(deps.db, task.task_id);
+  if (!art || art.attempt_id === null || art.escalation_nonce === null) {
+    return [];
+  }
+
+  const results: TickTaskResult[] = [];
+  const threadRef = task.slack_thread_ref;
+
+  // Step 1: capture the pre-post fence if not yet captured.
+  if (art.slack_pre_post_fence_ts === null) {
+    const fenceTs = deps.slack.fenceTs(threadRef);
+    const upd = deps.db
+      .query(
+        `UPDATE artifacts
+            SET slack_pre_post_fence_ts = ?
+          WHERE artifact_id = ?
+            AND slack_pre_post_fence_ts IS NULL`,
+      )
+      .run(fenceTs, art.artifact_id);
+    const changed = (upd as { changes?: number }).changes ?? 0;
+    if (changed > 0) {
+      art.slack_pre_post_fence_ts = fenceTs;
+      results.push({ task_id: task.task_id, action: "slack_fence_captured" });
+    }
+  }
+
+  // Step 2: try to recover an existing post via the nonce.
+  if (art.slack_recovered_post_ts === null) {
+    const match = deps.slack.searchByNonce(threadRef, art.escalation_nonce);
+    if (match !== null) {
+      // Persist recovered ts (and slack_post_ts if NULL) in one txn.
+      // Predicate: cancel_requested_at IS NULL on the task row.
+      deps.db.exec("BEGIN IMMEDIATE");
+      try {
+        const guard = deps.db
+          .query<{ n: number }, [string]>(
+            `SELECT 1 AS n FROM tasks
+              WHERE task_id = ? AND cancel_requested_at IS NULL`,
+          )
+          .get(task.task_id);
+        if (!guard) {
+          deps.db.exec("ROLLBACK");
+          return results;
+        }
+        deps.db
+          .query(
+            `UPDATE artifacts
+                SET slack_recovered_post_ts = ?,
+                    slack_post_ts = COALESCE(slack_post_ts, ?)
+              WHERE artifact_id = ?
+                AND slack_recovered_post_ts IS NULL`,
+          )
+          .run(match.ts, match.ts, art.artifact_id);
+        deps.db.exec("COMMIT");
+        art.slack_recovered_post_ts = match.ts;
+        if (art.slack_post_ts === null) art.slack_post_ts = match.ts;
+        results.push({ task_id: task.task_id, action: "slack_post_recovered" });
+        fireFailpoint("after_slack_recovery_ts_commit");
+      } catch (err) {
+        try {
+          deps.db.exec("ROLLBACK");
+        } catch {}
+        throw err;
+      }
+    }
+  }
+
+  // Step 3: post if no recovery match and no post yet.
+  if (art.slack_post_ts === null && art.slack_recovered_post_ts === null) {
+    const body = readEscalationBody(art.file_path);
+    const composedBody = `${body}\n\n_${art.escalation_nonce}_`;
+    let postTs: string;
+    try {
+      postTs = deps.slack.post({ threadRef, body: composedBody }).ts;
+    } catch (err) {
+      // Slack API failure: log tick_error and skip; next tick retries.
+      // The artifact stays without slack_post_ts so the recovery loop
+      // re-enters here on the next tick.
+      results.push(recordTickError(deps, task.task_id, err));
+      return results;
+    }
+    fireFailpoint("after_slack_post");
+    deps.db.exec("BEGIN IMMEDIATE");
+    try {
+      const guard = deps.db
+        .query<{ n: number }, [string]>(
+          `SELECT 1 AS n FROM tasks
+            WHERE task_id = ? AND cancel_requested_at IS NULL`,
+        )
+        .get(task.task_id);
+      if (!guard) {
+        deps.db.exec("ROLLBACK");
+        return results;
+      }
+      deps.db
+        .query(
+          `UPDATE artifacts
+              SET slack_post_ts = ?,
+                  slack_recovered_post_ts = ?
+            WHERE artifact_id = ?
+              AND slack_post_ts IS NULL`,
+        )
+        .run(postTs, postTs, art.artifact_id);
+      deps.db.exec("COMMIT");
+      art.slack_post_ts = postTs;
+      art.slack_recovered_post_ts = postTs;
+      results.push({ task_id: task.task_id, action: "slack_posted" });
+    } catch (err) {
+      try {
+        deps.db.exec("ROLLBACK");
+      } catch {}
+      throw err;
+    }
+    return results;
+  }
+
+  // Step 4: ingest replies. Lower bound is recovered ts when known, else
+  // the pre-post fence.
+  const lowerBound =
+    art.slack_recovered_post_ts !== null
+      ? art.slack_recovered_post_ts
+      : art.slack_pre_post_fence_ts;
+  if (lowerBound === null) {
+    return results;
+  }
+  const replies = deps.slack.listReplies(threadRef, lowerBound);
+  const lb = Number(lowerBound);
+  const firstNonBot = replies.find(
+    (r) => !r.authorBot && Number(r.ts) > lb,
+  );
+  if (!firstNonBot) {
+    if (results.length === 0) results.push({ task_id: task.task_id, action: "slack_skipped" });
+    return results;
+  }
+
+  ingestSlackReply(deps, task, art, firstNonBot);
+  results.push({ task_id: task.task_id, action: "slack_reply_ingested" });
+  return results;
+}
+
+function readEscalationBody(filePath: string): string {
+  try {
+    return readFileSync(filePath, "utf8");
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `unable to read slack_escalation_post artifact at ${filePath}: ${message}`,
+    );
+  }
+}
+
+function ingestSlackReply(
+  deps: TickDeps,
+  task: WaitingHumanTaskRow,
+  art: EscalationArtifactRow,
+  reply: { ts: string; authorBot: boolean; text: string },
+): void {
+  const attemptId = art.attempt_id!;
+  const replyContent = JSON.stringify({
+    ts: reply.ts,
+    text: reply.text,
+    authorBot: reply.authorBot,
+  });
+  const replyContentHash = createHash("sha256").update(replyContent).digest("hex");
+
+  const now = deps.clock.nowISO();
+  deps.db.exec("BEGIN IMMEDIATE");
+  try {
+    const guard = deps.db
+      .query<{ n: number }, [string]>(
+        `SELECT 1 AS n FROM tasks
+          WHERE task_id = ? AND state = 'waiting_human' AND cancel_requested_at IS NULL`,
+      )
+      .get(task.task_id);
+    if (!guard) {
+      deps.db.exec("ROLLBACK");
+      return;
+    }
+
+    const artifact = deps.artifactStore.writeArtifact({
+      taskId: task.task_id,
+      attemptId,
+      kind: "slack_reply",
+      content: replyContent,
+      extension: "json",
+    });
+    // Set the explicit content_hash so it matches what the recovery-path
+    // partial unique index expects (the artifact store already wrote it,
+    // but content_hash can also act as the cursor for downstream reads).
+    deps.db
+      .query(`UPDATE artifacts SET content_hash = ? WHERE artifact_id = ?`)
+      .run(replyContentHash, artifact.artifactId);
+
+    const upd = deps.db
+      .query(
+        `UPDATE tasks
+            SET state = 'awaiting-next-brief',
+                tick_error = NULL,
+                updated_at = ?
+          WHERE task_id = ?
+            AND state = 'waiting_human'
+            AND cancel_requested_at IS NULL`,
+      )
+      .run(now, task.task_id);
+    const changed = (upd as { changes?: number }).changes ?? 0;
+    if (changed === 0) {
+      deps.db.exec("ROLLBACK");
+      return;
+    }
+
+    deps.db
+      .query(
+        `INSERT INTO events (
+           task_id, attempt_id, event_type, from_state, to_state,
+           payload_artifact_id, occurred_at
+         ) VALUES (?, ?, 'slack_reply_ingested', 'waiting_human', 'awaiting-next-brief', ?, ?)`,
+      )
+      .run(task.task_id, attemptId, artifact.artifactId, now);
+
+    deps.db.exec("COMMIT");
+  } catch (err) {
+    try {
+      deps.db.exec("ROLLBACK");
+    } catch {}
+    throw err;
+  }
 }
 
 function loadLatestAttempt(db: DB, taskId: string): CurrentAttemptRow | null {
