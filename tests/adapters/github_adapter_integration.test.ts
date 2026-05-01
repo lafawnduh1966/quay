@@ -9,7 +9,7 @@ const integration = process.env.QUAY_INTEGRATION_TESTS === "1";
 
 describe.skipIf(!integration)("GitHubCliAdapter contract (integration)", () => {
   test("instantiates without error", () => {
-    expect(new GitHubCliAdapter()).toBeDefined();
+    expect(new GitHubCliAdapter("/tmp/quay-fake-repos-root")).toBeDefined();
   });
 
   // Real contract assertions land here once a test repo + creds are wired in

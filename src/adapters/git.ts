@@ -2,8 +2,8 @@
 // bare-clone root (`<reposRoot>/<repo_id>.git`). All shell-out calls go
 // through `Bun.spawnSync`; none of them invoke a shell, so repo ids and branch
 // names cannot smuggle metacharacters into the command line.
-import { existsSync, rmSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readFileSync, rmSync } from "node:fs";
+import { join, resolve } from "node:path";
 import type { GitPort } from "../ports/git.ts";
 
 interface RunResult {
@@ -153,12 +153,32 @@ export class LocalGitAdapter implements GitPort {
   }
 
   worktreeDetach(worktreePath: string): void {
-    // `git worktree remove --force` does both detach and remove; expose
-    // detach as a separate op for callers that want to keep the directory
-    // around. Implemented as `move` to a deleted path is unsafe, so we use
-    // `git worktree remove --force` here too — the directory is then re-added
-    // on retry. In practice the cancel finalizer always pairs detach + remove.
-    this.worktreeRemove(worktreePath);
+    // Severs the bare clone's tracking of this worktree WITHOUT deleting the
+    // directory contents — this is what `quay cancel --keep-worktree`
+    // relies on. `git worktree remove --force` always deletes; the manual
+    // recipe is to drop the gitfile (`<worktree>/.git`) and the matching
+    // admin directory inside the bare clone (`<bare>/worktrees/<name>`).
+    // Once both are gone, the bare clone no longer thinks the branch is
+    // checked out, so `git branch -D` succeeds; the worktree directory is
+    // left as a pile of plain files for the operator.
+    if (!existsSync(worktreePath)) return;
+    const gitfile = join(worktreePath, ".git");
+    let adminDir: string | null = null;
+    try {
+      const contents = readFileSync(gitfile, "utf8");
+      const m = contents.match(/^gitdir:\s*(.+)$/m);
+      if (m && m[1]) adminDir = m[1].trim();
+    } catch {
+      // No .git pointer — already detached, treat as a no-op.
+    }
+    try {
+      rmSync(gitfile, { force: true });
+    } catch {}
+    if (adminDir !== null) {
+      try {
+        rmSync(adminDir, { recursive: true, force: true });
+      } catch {}
+    }
   }
 
   worktreeRemove(worktreePath: string): void {
@@ -241,7 +261,24 @@ export class LocalGitAdapter implements GitPort {
   }
 
   private bareDir(repoId: string): string {
-    return join(this.reposRoot, `${repoId}.git`);
+    // Defense-in-depth: the schema (`src/core/repos/schema.ts`) already
+    // restricts `repo_id` to a safe identifier charset, but the adapter is
+    // the last hop before a real `rm`/`git clone` runs against the path, so
+    // it re-checks here. Any `repo_id` containing path separators or
+    // resolving outside `reposRoot` is refused — making traversal a hard
+    // error rather than a silent escape if a future code path skips the
+    // schema.
+    if (!/^[A-Za-z0-9._-]+$/.test(repoId) || repoId === "." || repoId === "..") {
+      throw new Error(`repo_id "${repoId}" is not a safe identifier`);
+    }
+    const root = resolve(this.reposRoot);
+    const dir = resolve(this.reposRoot, `${repoId}.git`);
+    if (!dir.startsWith(`${root}/`) && dir !== root) {
+      throw new Error(
+        `repo_id "${repoId}" escapes reposRoot (${root}); refusing to operate`,
+      );
+    }
+    return dir;
   }
 }
 

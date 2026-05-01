@@ -49,7 +49,7 @@ async function main(): Promise<number> {
     clock,
     ids,
     git: new LocalGitAdapter(reposRoot),
-    github: new GitHubCliAdapter(),
+    github: new GitHubCliAdapter(reposRoot),
     tmux: new TmuxAdapter(),
     slack: new SlackAdapter(),
     commandRunner: new ShellCommandRunner(),
