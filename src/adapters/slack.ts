@@ -1,5 +1,6 @@
-// Real Slack adapter. Slice 10 step 7 (stub). Contract tests gated behind
-// QUAY_INTEGRATION_TESTS=1 and skipped by default.
+// Real Slack adapter (stub). Contract tests gated behind
+// QUAY_INTEGRATION_TESTS=1 and skipped by default; real Web API implementations
+// land alongside the integration suite.
 import type {
   SlackPort,
   SlackPostInput,

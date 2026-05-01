@@ -1,5 +1,6 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
+import { isValidGitRef } from "../../../src/core/branch_slug.ts";
 import type { GitPort } from "../../../src/ports/git.ts";
 
 export interface FakeGitCall {
@@ -176,5 +177,15 @@ export class FakeGit implements GitPort {
   }
   countCalls(op: string): number {
     return this.calls.filter((c) => c.op === op).length;
+  }
+
+  // Mirrors the real adapter's `git check-ref-format` gate: tests use the JS
+  // validator so the contract stays decoupled from a tmpdir-based git probe.
+  safeBranchSlug(slug: string, taskIdShort: string): string {
+    this.record("safeBranchSlug", { slug, taskIdShort });
+    if (slug === "" || !isValidGitRef(`quay/${slug}`)) {
+      return `task-${taskIdShort}`;
+    }
+    return slug;
   }
 }

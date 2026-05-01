@@ -23,4 +23,8 @@ export interface GitPort {
   // Idempotent `git push origin --delete <branch>`. Real adapter tolerates
   // "remote ref does not exist" and any other non-fatal error.
   deleteRemoteBranch(repoId: string, branch: string): void;
+  // Final defense-in-depth gate after the JS slug normalizer (spec §13):
+  // returns the input slug if `git check-ref-format refs/heads/quay/<slug>`
+  // accepts it, otherwise returns `task-<taskIdShort>`.
+  safeBranchSlug(slug: string, taskIdShort: string): string;
 }

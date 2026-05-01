@@ -4,7 +4,13 @@
 //
 // Production wiring (real adapters) lives in src/cli/index.ts. This module
 // stays free of adapter construction so tests can drive it with fakes.
+//
+// Command surface tracks spec §10. The flag-based forms (e.g.
+// `--repo <id> --brief-file <path>`) are the documented interface. A
+// `--input <json>` escape hatch is also accepted on write commands so tests
+// and tooling can hand a structured payload directly.
 
+import { readFileSync } from "node:fs";
 import type { ArtifactStore } from "../artifacts/store.ts";
 import type { DB } from "../db/connection.ts";
 import type { Clock } from "../ports/clock.ts";
@@ -74,33 +80,22 @@ export async function dispatch(
   const [head, ...rest] = argv;
   try {
     switch (head) {
-      case "task": {
+      case "task":
         return await handleTask(rest, deps, io);
-      }
-      case "tick": {
+      case "tick":
         return handleTick(rest, deps, io);
-      }
-      case "enqueue": {
+      case "enqueue":
         return handleEnqueue(rest, deps, io);
-      }
-      case "repo": {
+      case "repo":
         return handleRepo(rest, deps, io);
-      }
-      case "cancel": {
+      case "cancel":
         return handleCancel(rest, deps, io);
-      }
-      case "claim": {
-        return handleClaim(rest, deps, io);
-      }
-      case "release-claim": {
-        return handleReleaseClaim(rest, deps, io);
-      }
-      case "submit-brief": {
+      case "submit-brief":
         return handleSubmitBrief(rest, deps, io);
-      }
-      case "escalate-human": {
+      case "escalate-human":
         return handleEscalateHuman(rest, deps, io);
-      }
+      case "artifact":
+        return handleArtifact(rest, deps, io);
       default:
         return writeError(io, "usage_error", `unknown command: ${head}`, {
           command: head,
@@ -133,28 +128,91 @@ async function handleTask(
   }
   const [sub, ...rest] = argv;
   switch (sub) {
-    case "list": {
-      const rows = listTasks(deps.db);
-      io.stdout(`${JSON.stringify(rows)}\n`);
-      return { exitCode: 0 };
-    }
-    case "get": {
-      const taskId = rest[0];
-      if (!taskId) {
-        return writeError(io, "usage_error", "task get requires <task_id>");
-      }
-      const payload = getTask(deps.db, taskId);
-      if (!payload) {
-        return writeError(io, "unknown_task", `task ${taskId} not found`, {
-          task_id: taskId,
-        });
-      }
-      io.stdout(`${JSON.stringify(payload)}\n`);
-      return { exitCode: 0 };
-    }
+    case "list":
+      return handleTaskList(rest, deps, io);
+    case "get":
+      return handleTaskGet(rest, deps, io);
+    case "events":
+      return handleTaskEvents(rest, deps, io);
+    case "claim":
+      return handleClaim(rest, deps, io);
+    case "release-claim":
+      return handleReleaseClaim(rest, deps, io);
     default:
       return writeError(io, "usage_error", `unknown task subcommand: ${sub}`);
   }
+}
+
+function handleTaskList(
+  argv: string[],
+  deps: CliDeps,
+  io: CliIO,
+): DispatchResult {
+  const states = collectFlagValues(argv, "--state");
+  const repo = readFlag(argv, "--repo");
+  const externalRef = readFlag(argv, "--external-ref");
+  const rows = listTasks(deps.db).filter((r) => {
+    if (states.length > 0 && !states.includes(r.state)) return false;
+    if (repo !== null && r.repo_id !== repo) return false;
+    if (externalRef !== null && r.external_ref !== externalRef) return false;
+    return true;
+  });
+  io.stdout(`${JSON.stringify(rows)}\n`);
+  return { exitCode: 0 };
+}
+
+function handleTaskGet(
+  argv: string[],
+  deps: CliDeps,
+  io: CliIO,
+): DispatchResult {
+  const taskId = positional(argv);
+  if (!taskId) {
+    return writeError(io, "usage_error", "task get requires <task_id>");
+  }
+  const payload = getTask(deps.db, taskId);
+  if (!payload) {
+    return writeError(io, "unknown_task", `task ${taskId} not found`, {
+      task_id: taskId,
+    });
+  }
+  io.stdout(`${JSON.stringify(payload)}\n`);
+  return { exitCode: 0 };
+}
+
+interface EventRow {
+  event_id: number;
+  task_id: string;
+  attempt_id: number | null;
+  event_type: string;
+  from_state: string | null;
+  to_state: string | null;
+  payload_artifact_id: number | null;
+  occurred_at: string;
+}
+
+function handleTaskEvents(
+  argv: string[],
+  deps: CliDeps,
+  io: CliIO,
+): DispatchResult {
+  const taskId = positional(argv);
+  if (!taskId) {
+    return writeError(io, "usage_error", "task events requires <task_id>");
+  }
+  // `task events` returns the full append-only log, oldest first, so callers
+  // can stream/replay transitions without reconciling reverse-order results.
+  const events = deps.db
+    .query<EventRow, [string]>(
+      `SELECT event_id, task_id, attempt_id, event_type, from_state, to_state,
+              payload_artifact_id, occurred_at
+         FROM events
+        WHERE task_id = ?
+        ORDER BY occurred_at ASC, event_id ASC`,
+    )
+    .all(taskId);
+  io.stdout(`${JSON.stringify(events)}\n`);
+  return { exitCode: 0 };
 }
 
 function handleTick(
@@ -175,8 +233,35 @@ function handleEnqueue(
   deps: CliDeps,
   io: CliIO,
 ): DispatchResult {
-  const input = parseJsonFlag(argv);
-  if (!input.ok) return writeError(io, "usage_error", input.message);
+  const json = tryParseJsonFlag(argv);
+  if (!json.ok) return writeError(io, "usage_error", json.message);
+  let input: Record<string, unknown>;
+  if (json.value !== undefined) {
+    input = json.value as Record<string, unknown>;
+  } else {
+    // Spec §10: enqueue takes flag-based inputs.
+    const repoId = readFlag(argv, "--repo");
+    if (repoId === null) {
+      return writeError(io, "usage_error", "enqueue requires --repo <id>");
+    }
+    const briefPath = readFlag(argv, "--brief-file");
+    if (briefPath === null) {
+      return writeError(io, "usage_error", "enqueue requires --brief-file <path>");
+    }
+    const ticketPath = readFlag(argv, "--ticket-snapshot-file");
+    const externalRef = readFlag(argv, "--external-ref");
+    const slackThreadRef = readFlag(argv, "--slack-thread-ref");
+    const briefRead = tryReadFile(briefPath);
+    if (!briefRead.ok) return writeError(io, "usage_error", briefRead.message);
+    input = { repo_id: repoId, brief: briefRead.value };
+    if (ticketPath !== null) {
+      const t = tryReadFile(ticketPath);
+      if (!t.ok) return writeError(io, "usage_error", t.message);
+      input.ticket_snapshot = t.value;
+    }
+    if (externalRef !== null) input.external_ref = externalRef;
+    if (slackThreadRef !== null) input.slack_thread_ref = slackThreadRef;
+  }
   const enqueueDeps: EnqueueDeps = {
     db: deps.db,
     clock: deps.clock,
@@ -186,7 +271,7 @@ function handleEnqueue(
     artifactStore: deps.artifactStore,
     paths: deps.paths,
   };
-  const result = enqueue(enqueueDeps, input.value);
+  const result = enqueue(enqueueDeps, input);
   io.stdout(`${JSON.stringify(result)}\n`);
   return { exitCode: 0 };
 }
@@ -202,26 +287,12 @@ function handleRepo(
   const [sub, ...rest] = argv;
   const service = createRepoService({ db: deps.db, clock: deps.clock });
   switch (sub) {
-    case "add": {
-      const input = parseJsonFlag(rest);
-      if (!input.ok) return writeError(io, "usage_error", input.message);
-      const row = service.add(input.value);
-      io.stdout(`${JSON.stringify(row)}\n`);
-      return { exitCode: 0 };
-    }
-    case "update": {
-      const repoId = rest[0];
-      if (!repoId) {
-        return writeError(io, "usage_error", "repo update requires <repo_id>");
-      }
-      const input = parseJsonFlag(rest.slice(1));
-      if (!input.ok) return writeError(io, "usage_error", input.message);
-      const row = service.update(repoId, input.value);
-      io.stdout(`${JSON.stringify(row)}\n`);
-      return { exitCode: 0 };
-    }
+    case "add":
+      return handleRepoAdd(rest, service, io);
+    case "update":
+      return handleRepoUpdate(rest, service, io);
     case "remove": {
-      const repoId = rest[0];
+      const repoId = positional(rest);
       if (!repoId) {
         return writeError(io, "usage_error", "repo remove requires <repo_id>");
       }
@@ -234,12 +305,59 @@ function handleRepo(
   }
 }
 
+const REPO_FLAGS: Array<{ flag: string; key: string }> = [
+  { flag: "--id", key: "repo_id" },
+  { flag: "--url", key: "repo_url" },
+  { flag: "--base-branch", key: "base_branch" },
+  { flag: "--package-manager", key: "package_manager" },
+  { flag: "--install-cmd", key: "install_cmd" },
+  { flag: "--test-cmd", key: "test_cmd" },
+  { flag: "--ci-workflow-name", key: "ci_workflow_name" },
+  { flag: "--contribution-guide-path", key: "contribution_guide_path" },
+];
+
+function handleRepoAdd(
+  argv: string[],
+  service: ReturnType<typeof createRepoService>,
+  io: CliIO,
+): DispatchResult {
+  const json = tryParseJsonFlag(argv);
+  if (!json.ok) return writeError(io, "usage_error", json.message);
+  const input = json.value !== undefined ? json.value : flagsToObject(argv, REPO_FLAGS);
+  const row = service.add(input);
+  io.stdout(`${JSON.stringify(row)}\n`);
+  return { exitCode: 0 };
+}
+
+function handleRepoUpdate(
+  argv: string[],
+  service: ReturnType<typeof createRepoService>,
+  io: CliIO,
+): DispatchResult {
+  const repoId = readFlag(argv, "--id") ?? positional(argv);
+  if (!repoId) {
+    return writeError(io, "usage_error", "repo update requires --id <repo_id>");
+  }
+  const json = tryParseJsonFlag(argv);
+  if (!json.ok) return writeError(io, "usage_error", json.message);
+  const patch = json.value !== undefined
+    ? json.value
+    : flagsToObject(
+        argv,
+        // --id is the row selector, not a column to update.
+        REPO_FLAGS.filter((f) => f.flag !== "--id"),
+      );
+  const row = service.update(repoId, patch);
+  io.stdout(`${JSON.stringify(row)}\n`);
+  return { exitCode: 0 };
+}
+
 function handleCancel(
   argv: string[],
   deps: CliDeps,
   io: CliIO,
 ): DispatchResult {
-  const taskId = argv[0];
+  const taskId = positional(argv);
   if (!taskId) {
     return writeError(io, "usage_error", "cancel requires <task_id>");
   }
@@ -263,9 +381,9 @@ function handleCancel(
 }
 
 function handleClaim(argv: string[], deps: CliDeps, io: CliIO): DispatchResult {
-  const taskId = argv[0];
+  const taskId = positional(argv);
   if (!taskId) {
-    return writeError(io, "usage_error", "claim requires <task_id>");
+    return writeError(io, "usage_error", "task claim requires <task_id>");
   }
   const claimDeps: ClaimDeps = { db: deps.db, clock: deps.clock };
   return emitServiceResult(claim_task(claimDeps, { taskId }), io);
@@ -276,13 +394,15 @@ function handleReleaseClaim(
   deps: CliDeps,
   io: CliIO,
 ): DispatchResult {
-  const taskId = argv[0];
-  const claimId = argv[1];
+  const taskId = positional(argv);
+  // `--claim-id <id>` is the spec form. Also accept a positional second arg
+  // for backwards compatibility with the previous CLI wiring.
+  const claimId = readFlag(argv, "--claim-id") ?? positionalAt(argv, 1);
   if (!taskId || !claimId) {
     return writeError(
       io,
       "usage_error",
-      "release-claim requires <task_id> <claim_id>",
+      "task release-claim requires <task_id> --claim-id <claim_id>",
     );
   }
   const claimDeps: ClaimDeps = { db: deps.db, clock: deps.clock };
@@ -294,14 +414,48 @@ function handleSubmitBrief(
   deps: CliDeps,
   io: CliIO,
 ): DispatchResult {
-  const input = parseJsonFlag(argv);
-  if (!input.ok) return writeError(io, "usage_error", input.message);
+  const json = tryParseJsonFlag(argv);
+  if (!json.ok) return writeError(io, "usage_error", json.message);
+  let input: { taskId: string; claimId: string; brief: string; reason: string };
+  if (json.value !== undefined) {
+    input = json.value as never;
+  } else {
+    const taskId = positional(argv);
+    const claimId = readFlag(argv, "--claim-id");
+    const briefFile = readFlag(argv, "--brief-file");
+    const reason = readFlag(argv, "--reason");
+    if (!taskId || !claimId || !briefFile || !reason) {
+      return writeError(
+        io,
+        "usage_error",
+        "submit-brief requires <task_id> --claim-id <id> --brief-file <path> --reason <blocker_resolved|advice_answered>",
+      );
+    }
+    const briefRead = tryReadFile(briefFile);
+    if (!briefRead.ok) return writeError(io, "usage_error", briefRead.message);
+    input = { taskId, claimId, brief: briefRead.value, reason };
+  }
+  if (input.reason !== "blocker_resolved" && input.reason !== "advice_answered") {
+    return writeError(
+      io,
+      "usage_error",
+      `submit-brief --reason must be blocker_resolved or advice_answered (got ${input.reason})`,
+    );
+  }
   const submitDeps: SubmitBriefDeps = {
     db: deps.db,
     clock: deps.clock,
     artifactStore: deps.artifactStore,
   };
-  return emitServiceResult(submit_brief(submitDeps, input.value as never), io);
+  return emitServiceResult(
+    submit_brief(submitDeps, {
+      taskId: input.taskId,
+      claimId: input.claimId,
+      brief: input.brief,
+      reason: input.reason as "blocker_resolved" | "advice_answered",
+    }),
+    io,
+  );
 }
 
 function handleEscalateHuman(
@@ -309,15 +463,110 @@ function handleEscalateHuman(
   deps: CliDeps,
   io: CliIO,
 ): DispatchResult {
-  const input = parseJsonFlag(argv);
-  if (!input.ok) return writeError(io, "usage_error", input.message);
+  const json = tryParseJsonFlag(argv);
+  if (!json.ok) return writeError(io, "usage_error", json.message);
+  let input: {
+    taskId: string;
+    claimId: string;
+    questionBody: string;
+    threadRef?: string | null;
+  };
+  if (json.value !== undefined) {
+    input = json.value as never;
+  } else {
+    const taskId = positional(argv);
+    const claimId = readFlag(argv, "--claim-id");
+    const questionFile = readFlag(argv, "--question-file");
+    const threadRef = readFlag(argv, "--thread-ref");
+    if (!taskId || !claimId || !questionFile) {
+      return writeError(
+        io,
+        "usage_error",
+        "escalate-human requires <task_id> --claim-id <id> --question-file <path> [--thread-ref <ref>]",
+      );
+    }
+    const qRead = tryReadFile(questionFile);
+    if (!qRead.ok) return writeError(io, "usage_error", qRead.message);
+    input = {
+      taskId,
+      claimId,
+      questionBody: qRead.value,
+      threadRef: threadRef ?? null,
+    };
+  }
   const escalateDeps: EscalateHumanDeps = {
     db: deps.db,
     clock: deps.clock,
     ids: deps.ids,
     artifactStore: deps.artifactStore,
   };
-  return emitServiceResult(escalate_human(escalateDeps, input.value as never), io);
+  return emitServiceResult(escalate_human(escalateDeps, input), io);
+}
+
+interface ArtifactRow {
+  artifact_id: number;
+  task_id: string;
+  attempt_id: number | null;
+  kind: string;
+  file_path: string;
+  captured_at: string;
+}
+
+function handleArtifact(
+  argv: string[],
+  deps: CliDeps,
+  io: CliIO,
+): DispatchResult {
+  if (argv.length === 0 || argv[0] !== "get") {
+    return writeError(io, "usage_error", "artifact subcommand required (get)");
+  }
+  const rest = argv.slice(1);
+  const taskId = positional(rest);
+  const kind = positionalAt(rest, 1);
+  if (!taskId || !kind) {
+    return writeError(
+      io,
+      "usage_error",
+      "artifact get requires <task_id> <kind>",
+    );
+  }
+  const attemptArg = readFlag(rest, "--attempt");
+  const attemptId = attemptArg !== null ? Number.parseInt(attemptArg, 10) : null;
+  if (attemptArg !== null && Number.isNaN(attemptId)) {
+    return writeError(io, "usage_error", `--attempt must be an integer (got ${attemptArg})`);
+  }
+  const wantPath = rest.includes("--path");
+
+  // Latest matching artifact wins. Filter by attempt_id when provided.
+  const row =
+    attemptId === null
+      ? deps.db
+          .query<ArtifactRow, [string, string]>(
+            `SELECT artifact_id, task_id, attempt_id, kind, file_path, captured_at
+               FROM artifacts WHERE task_id = ? AND kind = ?
+              ORDER BY artifact_id DESC LIMIT 1`,
+          )
+          .get(taskId, kind)
+      : deps.db
+          .query<ArtifactRow, [string, string, number]>(
+            `SELECT artifact_id, task_id, attempt_id, kind, file_path, captured_at
+               FROM artifacts WHERE task_id = ? AND kind = ? AND attempt_id = ?
+              ORDER BY artifact_id DESC LIMIT 1`,
+          )
+          .get(taskId, kind, attemptId);
+  if (!row) {
+    return writeError(io, "unknown_artifact", `no ${kind} artifact for task ${taskId}`, {
+      task_id: taskId,
+      kind,
+      attempt_id: attemptId,
+    });
+  }
+  if (wantPath) {
+    io.stdout(`${row.file_path}\n`);
+    return { exitCode: 0 };
+  }
+  io.stdout(readFileSync(row.file_path, "utf8"));
+  return { exitCode: 0 };
 }
 
 function emitServiceResult<T>(
@@ -346,38 +595,101 @@ function pickTickDeps(deps: CliDeps): TickDeps {
   };
 }
 
+// --- argv helpers --------------------------------------------------------
+
 type ParseResult =
-  | { ok: true; value: unknown }
+  | { ok: true; value: unknown | undefined }
   | { ok: false; message: string };
 
-// Accepts `--input <json>` or `--input=<json>`. Treats a single positional
-// argument as a JSON literal too.
-function parseJsonFlag(argv: string[]): ParseResult {
-  let raw: string | undefined;
-  for (let i = 0; i < argv.length; i += 1) {
-    const a = argv[i];
-    if (a === undefined) continue;
-    if (a === "--input") {
-      raw = argv[i + 1];
-      break;
-    }
-    if (a.startsWith("--input=")) {
-      raw = a.slice("--input=".length);
-      break;
-    }
-  }
-  if (raw === undefined && argv.length === 1) {
-    raw = argv[0];
-  }
-  if (raw === undefined) {
-    return { ok: false, message: "missing --input <json>" };
-  }
+// Returns { ok: true, value: undefined } when --input is not present, so the
+// caller falls through to flag-based parsing without an error.
+function tryParseJsonFlag(argv: string[]): ParseResult {
+  const raw = readFlag(argv, "--input");
+  if (raw === null) return { ok: true, value: undefined };
   try {
     return { ok: true, value: JSON.parse(raw) };
   } catch (err) {
     return {
       ok: false,
       message: `invalid JSON for --input: ${(err as Error).message}`,
+    };
+  }
+}
+
+// Reads `--flag <value>` or `--flag=<value>`. Returns null when absent.
+function readFlag(argv: string[], flag: string): string | null {
+  const eq = `${flag}=`;
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === undefined) continue;
+    if (a === flag) return argv[i + 1] ?? null;
+    if (a.startsWith(eq)) return a.slice(eq.length);
+  }
+  return null;
+}
+
+// Repeatable flag — collects every `--flag <v>` / `--flag=<v>` occurrence.
+function collectFlagValues(argv: string[], flag: string): string[] {
+  const out: string[] = [];
+  const eq = `${flag}=`;
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === undefined) continue;
+    if (a === flag) {
+      const v = argv[i + 1];
+      if (v !== undefined) out.push(v);
+    } else if (a.startsWith(eq)) {
+      out.push(a.slice(eq.length));
+    }
+  }
+  return out;
+}
+
+// First non-flag token.
+function positional(argv: string[]): string | null {
+  return positionalAt(argv, 0);
+}
+
+// Nth non-flag token (skipping every `--flag <value>` pair).
+function positionalAt(argv: string[], n: number): string | null {
+  let count = 0;
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === undefined) continue;
+    if (a.startsWith("--")) {
+      // Flags with `=` are self-contained; flags without an `=` consume the
+      // next token unless that next token is itself a `--flag`.
+      if (!a.includes("=")) {
+        const next = argv[i + 1];
+        if (next !== undefined && !next.startsWith("--")) i += 1;
+      }
+      continue;
+    }
+    if (count === n) return a;
+    count += 1;
+  }
+  return null;
+}
+
+function flagsToObject(
+  argv: string[],
+  spec: ReadonlyArray<{ flag: string; key: string }>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const { flag, key } of spec) {
+    const v = readFlag(argv, flag);
+    if (v !== null) out[key] = v;
+  }
+  return out;
+}
+
+function tryReadFile(path: string): { ok: true; value: string } | { ok: false; message: string } {
+  try {
+    return { ok: true, value: readFileSync(path, "utf8") };
+  } catch (err) {
+    return {
+      ok: false,
+      message: `failed to read ${path}: ${(err as Error).message}`,
     };
   }
 }

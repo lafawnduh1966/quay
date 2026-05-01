@@ -303,9 +303,18 @@ function resolveBranchName(
   externalRef: string | null,
   shortId: string,
 ): string {
-  const preferred = computeBranchSlug(externalRef, shortId);
+  // Step 1: JS-side normalization per spec §13. Already covers most cases,
+  // but the spec's step 7 requires the real `git check-ref-format` gate as
+  // defense-in-depth in case the rules above and git's own grammar drift.
+  const preferred = git.safeBranchSlug(
+    computeBranchSlug(externalRef, shortId),
+    shortId,
+  );
   if (!isBranchTaken(git, repoId, preferred)) return preferred;
-  const disambiguated = `${preferred}-${shortId}`;
+  // Step 2: collision suffix. Re-validate via the same gate — appending
+  // `-<shortId>` cannot introduce ref-illegal chars (shortId is hex), but the
+  // overall length might trip a check; safeBranchSlug is the single arbiter.
+  const disambiguated = git.safeBranchSlug(`${preferred}-${shortId}`, shortId);
   if (!isBranchTaken(git, repoId, disambiguated)) return disambiguated;
   throw new QuayError(
     "branch_collision_unresolvable",

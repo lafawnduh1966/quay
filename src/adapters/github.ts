@@ -1,5 +1,6 @@
-// Real GitHub adapter. Slice 10 step 7 (stub). Contract tests for this
-// adapter are gated behind QUAY_INTEGRATION_TESTS=1 and skipped by default.
+// Real GitHub adapter (stub). Contract tests for this adapter are gated
+// behind QUAY_INTEGRATION_TESTS=1 and skipped by default; real `gh` shell-out
+// implementations land alongside the integration suite.
 import type {
   GitHubPort,
   PrCheckStatus,

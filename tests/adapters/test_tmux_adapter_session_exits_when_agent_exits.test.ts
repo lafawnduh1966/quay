@@ -65,20 +65,21 @@ t("test_tmux_adapter_session_exits_when_agent_exits", async () => {
   const worktreePath = tempWorktree();
   const sessionName = uniqueSession("exit");
 
-  // Agent invocation that exits immediately. The {prompt_file} token must be
-  // accepted (it's not used here) since real callers always pass it.
+  // Use a `sleep` long enough that we can observe the session alive before
+  // killing it. A `true` invocation can race past the alive check on slow
+  // hosts; we pin the alive state instead, then prove the session goes away
+  // once the agent exits.
   adapter.spawn({
     sessionName,
     worktreePath,
     promptContent: "ignored",
-    agentInvocation: "true",
+    agentInvocation: "sleep 0.3",
   });
 
-  // Wait for the session to appear (spawn is async-ish), then for it to exit.
-  const becameAlive = await waitFor(
-    () => adapter.isAlive(sessionName) || true,
-    500,
-  );
+  // Real liveness probe: the tmux session must be observable before we can
+  // claim anything about its disappearance. `true` here would mask a broken
+  // adapter; we want the assertion to fail if isAlive never returns true.
+  const becameAlive = await waitFor(() => adapter.isAlive(sessionName), 1000);
   expect(becameAlive).toBe(true);
 
   // Once the agent exited, exec semantics tear down the tmux pane and the
