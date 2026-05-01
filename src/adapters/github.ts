@@ -220,7 +220,16 @@ export class GitHubCliAdapter implements GitHubPort {
         `gh pr checks returned unparseable JSON for ${branch}: ${(err as Error).message}`,
       );
     }
-    if (!Array.isArray(parsed)) return { checkSha: null, items: [] };
+    if (!Array.isArray(parsed)) {
+      // Fail closed: a non-array response from `gh pr checks` is not a
+      // documented "no checks" signal, so we cannot safely conclude the PR
+      // has zero checks. Surfacing this as a thrown error lets tick log
+      // `tick_error` and skip the transition rather than approving by
+      // default.
+      throw new Error(
+        `gh pr checks returned non-array JSON for ${branch}: ${result.stdout.slice(0, 200)}`,
+      );
+    }
 
     // Resolve required-check identity from a second `gh pr checks --required`
     // call. Match by (workflow, name) since `gh` does not expose a stable id.
@@ -252,17 +261,41 @@ export class GitHubCliAdapter implements GitHubPort {
       fields,
     ]);
     if (result.exitCode !== 0) {
-      // `--required` returns non-zero when there are no required checks.
-      // Treat the same as the unfiltered "no checks" path: empty set.
-      return new Set<string>();
+      // Fail closed. The empty-set return is reserved for *known* "no
+      // required checks" responses from `gh`. Anything else (auth failure,
+      // CLI version skew, GitHub API outage, rate limit, malformed output)
+      // must throw — otherwise tick's classifyCi sees "no required checks
+      // → pass" and silently approves a PR while required CI is failing.
+      const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
+      const isKnownNoChecks =
+        msg.includes("no checks") ||
+        msg.includes("no check runs") ||
+        msg.includes("no required checks") ||
+        // `gh pr checks --required` with no required checks at all has
+        // historically printed "no required checks reported on this branch"
+        // / "no required checks reported"; cover the prefix too.
+        msg.includes("no required");
+      if (isKnownNoChecks) return new Set<string>();
+      throw new Error(
+        `gh pr checks --required ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
+      );
     }
+    // Successful exit but unparseable JSON is also a fail-closed condition:
+    // `gh` is supposed to emit a JSON array, and a non-array means we cannot
+    // reason about which checks are required.
     let parsed: unknown;
     try {
       parsed = JSON.parse(result.stdout);
-    } catch {
-      return new Set<string>();
+    } catch (err) {
+      throw new Error(
+        `gh pr checks --required returned unparseable JSON for ${branch}: ${(err as Error).message}`,
+      );
     }
-    if (!Array.isArray(parsed)) return new Set<string>();
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `gh pr checks --required returned non-array JSON for ${branch}: ${result.stdout.slice(0, 200)}`,
+      );
+    }
     const keys = new Set<string>();
     for (const row of parsed) {
       const r = (row ?? {}) as Record<string, unknown>;
@@ -278,7 +311,17 @@ export class GitHubCliAdapter implements GitHubPort {
 
   private run(repoId: string, cmd: string[]): RunResult {
     const cwd = this.bareDir(repoId);
-    const result = Bun.spawnSync({ cmd, cwd, stdout: "pipe", stderr: "pipe" });
+    // Forward `process.env` explicitly. Bun's `spawnSync` snapshots PATH at
+    // process startup unless a caller passes `env`, so without this line a
+    // test that stubs `gh` by mutating `process.env.PATH` at runtime would
+    // be silently ignored — the real `gh` binary would still resolve.
+    const result = Bun.spawnSync({
+      cmd,
+      cwd,
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
     return {
       exitCode: result.exitCode ?? 0,
       stdout: decode(result.stdout),
