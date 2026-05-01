@@ -42,15 +42,24 @@ export class GitHubCliAdapter implements GitHubPort {
   }
 
   prCheckStatus(repoId: string, branch: string): PrCheckStatus {
+    // `prCheckStatus` is the convenience read that does not flow through the
+    // tick-side `classifyCi` (which combines `ci_workflow_name` + required-
+    // only filtering). To stay consistent with §5, restrict the decision
+    // here to required checks only — same rule as the spec's fallback when
+    // no `ci_workflow_name` is set. Callers that need named-workflow
+    // semantics use `prSnapshot` + `classifyCi`.
     const checks = this.fetchChecks(repoId, branch);
-    if (checks.items.length === 0) return { state: "pending" };
-    const anyFail = checks.items.some((c) => c.bucket === "fail");
+    const required = checks.items.filter((c) => c.required);
+    if (required.length === 0) return { state: "pending" };
+    const anyFail = required.some(
+      (c) => c.bucket === "fail" || c.bucket === "cancelled",
+    );
     if (anyFail) {
       return checks.failureExcerpt !== undefined
         ? { state: "fail", excerpt: checks.failureExcerpt }
         : { state: "fail" };
     }
-    const anyPending = checks.items.some((c) => c.bucket === "pending");
+    const anyPending = required.some((c) => c.bucket === "pending");
     if (anyPending) return { state: "pending" };
     return { state: "pass" };
   }
@@ -179,6 +188,13 @@ export class GitHubCliAdapter implements GitHubPort {
 
   private fetchChecks(repoId: string, branch: string): PrChecksReport {
     const fields = ["bucket", "workflow", "name", "state"].join(",");
+    // Two passes: the unfiltered set drives the named-workflow rule (which
+    // looks at every check matching `ci_workflow_name`), and the
+    // `--required` filtered set tells us *which* of those checks count when
+    // `ci_workflow_name` is unset and the spec falls back to required-only
+    // status. Without this second call, every check would be marked
+    // `required: false`, and the §5 rule "no required checks at all → pass"
+    // would silently fire on repos with failing required CI.
     const result = this.run(repoId, [
       "gh",
       "pr",
@@ -188,7 +204,6 @@ export class GitHubCliAdapter implements GitHubPort {
       fields,
     ]);
     if (result.exitCode !== 0) {
-      // No checks on this PR yet → empty set, treated as pending by §5.
       const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
       if (msg.includes("no checks") || msg.includes("not found")) {
         return { checkSha: null, items: [] };
@@ -206,7 +221,14 @@ export class GitHubCliAdapter implements GitHubPort {
       );
     }
     if (!Array.isArray(parsed)) return { checkSha: null, items: [] };
-    const items: PrCheck[] = parsed.map((row) => mapCheckRow(row));
+
+    // Resolve required-check identity from a second `gh pr checks --required`
+    // call. Match by (workflow, name) since `gh` does not expose a stable id.
+    const requiredKeys = this.fetchRequiredCheckKeys(repoId, branch);
+    const items: PrCheck[] = markRequired(
+      parsed.map((row) => mapCheckRow(row)),
+      requiredKeys,
+    );
     return {
       // `gh pr checks` doesn't expose the SHA the runs were against, so we
       // pass null. The stale-SHA detector in tick uses `headRefOid` from
@@ -216,6 +238,42 @@ export class GitHubCliAdapter implements GitHubPort {
       checkSha: null,
       items,
     };
+  }
+
+  private fetchRequiredCheckKeys(repoId: string, branch: string): Set<string> {
+    const fields = ["workflow", "name"].join(",");
+    const result = this.run(repoId, [
+      "gh",
+      "pr",
+      "checks",
+      branch,
+      "--required",
+      "--json",
+      fields,
+    ]);
+    if (result.exitCode !== 0) {
+      // `--required` returns non-zero when there are no required checks.
+      // Treat the same as the unfiltered "no checks" path: empty set.
+      return new Set<string>();
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(result.stdout);
+    } catch {
+      return new Set<string>();
+    }
+    if (!Array.isArray(parsed)) return new Set<string>();
+    const keys = new Set<string>();
+    for (const row of parsed) {
+      const r = (row ?? {}) as Record<string, unknown>;
+      const workflow =
+        r.workflow === null || r.workflow === undefined
+          ? ""
+          : String(r.workflow);
+      const name = String(r.name ?? "");
+      keys.add(requiredKeyOf({ workflow: workflow === "" ? null : workflow, name }));
+    }
+    return keys;
   }
 
   private run(repoId: string, cmd: string[]): RunResult {
@@ -264,6 +322,23 @@ function mapMergeable(raw: unknown): PrMergeableState {
   if (s === "MERGEABLE") return "mergeable";
   if (s === "CONFLICTING") return "conflicting";
   return "unknown";
+}
+
+// Stable key for matching a check row across the two `gh pr checks` calls
+// (unfiltered + `--required`). `gh` does not surface an opaque id, so we
+// identify a check by `(workflow, name)`. The `\x1f` separator ensures the
+// pair "workflow=foo, name=bar/baz" never collides with "workflow=foo/bar,
+// name=baz" — Slack/GitHub display ambiguity that a plain space would
+// preserve. Exported so the unit tests can exercise the join directly.
+export function requiredKeyOf(c: { workflow: string | null; name: string }): string {
+  return `${c.workflow ?? ""}\x1f${c.name}`;
+}
+
+// Walk the unfiltered check set and copy `required: true` onto items whose
+// `(workflow, name)` matches an entry in `requiredKeys`. Pure and
+// deterministic — exported for direct testing without a `gh` binary.
+export function markRequired(items: PrCheck[], requiredKeys: Set<string>): PrCheck[] {
+  return items.map((c) => ({ ...c, required: requiredKeys.has(requiredKeyOf(c)) }));
 }
 
 function mapCheckRow(row: unknown): PrCheck {

@@ -96,3 +96,49 @@ t("worktreeDetach preserves the worktree directory and contents", () => {
   // anything is checked out for that branch.
   adapter.branchDelete("test-repo", "quay/keep-worktree-task");
 });
+
+t("worktreeDetach refuses to follow a tampered .git pointer", () => {
+  // Threat model: a worker can write any string into `<worktree>/.git`. If
+  // detach blindly trusts the `gitdir:` line and `rmSync(..., recursive)`,
+  // a malicious worker turns `cancel --keep-worktree` into "delete any
+  // directory the Quay process can reach." Detach must clamp the recursive
+  // delete to the canonical `<reposRoot>/<repo_id>.git/worktrees/<name>`
+  // shape and skip otherwise.
+
+  const reposRoot = tempDir("quay-repos-tampered-");
+  const adapter = new LocalGitAdapter(reposRoot);
+
+  // Build a real bare clone + worktree first so the layout is plausible.
+  const upstream = tempDir("quay-upstream-tampered-");
+  shellGit(upstream, "init", "-q", "--initial-branch=main");
+  shellGit(upstream, "config", "user.email", "t@e");
+  shellGit(upstream, "config", "user.name", "t");
+  writeFileSync(join(upstream, "README.md"), "hi\n");
+  shellGit(upstream, "add", "README.md");
+  shellGit(upstream, "commit", "-q", "-m", "init");
+  adapter.cloneBare("test-repo", upstream);
+  adapter.fetch("test-repo", "main");
+
+  const worktreesRoot = tempDir("quay-worktrees-tampered-");
+  const worktreePath = join(worktreesRoot, "task-attack");
+  adapter.worktreeAdd(
+    "test-repo",
+    worktreePath,
+    "quay/attack",
+    "origin/main",
+  );
+
+  // Stand up a victim directory the adversary wants detach to clobber. It
+  // is fully outside reposRoot, so a correct detach must leave it alone.
+  const victim = tempDir("quay-victim-");
+  writeFileSync(join(victim, "DO_NOT_DELETE"), "this file must survive");
+
+  // Tamper with the worktree's .git pointer to point at the victim.
+  writeFileSync(join(worktreePath, ".git"), `gitdir: ${victim}\n`);
+
+  adapter.worktreeDetach(worktreePath);
+
+  // Containment fired: the victim and its file must still exist.
+  expect(existsSync(victim)).toBe(true);
+  expect(existsSync(join(victim, "DO_NOT_DELETE"))).toBe(true);
+});

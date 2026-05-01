@@ -158,6 +158,10 @@ export class SlackAdapter implements SlackPort {
     // alternative is to redesign SlackPort as async, which ripples through
     // every tick handler. We choose the small synchronous-shim cost over the
     // large refactor.
+    //
+    // The token MUST NOT be passed as argv — `ps`/`/proc/<pid>/cmdline`
+    // would expose it for the lifetime of the child process. Pass it via
+    // an inherited environment variable instead, scoped to this child.
     const result = Bun.spawnSync({
       cmd: [
         process.execPath,
@@ -168,8 +172,8 @@ export class SlackAdapter implements SlackPort {
         init.body !== undefined && init.body !== null
           ? String(init.body)
           : "",
-        token,
       ],
+      env: { ...process.env, QUAY_SLACK_TOKEN: token },
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -232,14 +236,19 @@ function decode(buf: Buffer | Uint8Array | undefined): string {
   return new TextDecoder().decode(buf);
 }
 
-// Child-process script: argv = [_, _, url, method, body, token]. Executes a
-// single fetch against `url` with the given method/body and prints the
-// response body to stdout. Errors print to stderr and exit non-zero.
+// Child-process script: argv = [_, _, url, method, body]; the token comes
+// in via the `QUAY_SLACK_TOKEN` env var so it never appears in `ps` output.
+// Executes a single fetch against `url` with the given method/body and
+// prints the response body to stdout. Errors print to stderr and exit
+// non-zero. Embedded as a string so the parent never needs a separate file.
 function slackFetchScript(): string {
-  // Embedded as a string so the parent never needs a separate file. Kept
-  // small and dependency-free.
   return `
-const [url, method, body, token] = process.argv.slice(1);
+const [url, method, body] = process.argv.slice(1);
+const token = process.env.QUAY_SLACK_TOKEN || "";
+if (!token) {
+  process.stderr.write("QUAY_SLACK_TOKEN not set in child env");
+  process.exit(1);
+}
 const init = { method, headers: { Authorization: "Bearer " + token } };
 if (method !== "GET" && body) {
   init.headers["Content-Type"] = "application/json; charset=utf-8";

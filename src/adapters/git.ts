@@ -2,7 +2,7 @@
 // bare-clone root (`<reposRoot>/<repo_id>.git`). All shell-out calls go
 // through `Bun.spawnSync`; none of them invoke a shell, so repo ids and branch
 // names cannot smuggle metacharacters into the command line.
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { join, resolve } from "node:path";
 import type { GitPort } from "../ports/git.ts";
 
@@ -161,23 +161,61 @@ export class LocalGitAdapter implements GitPort {
     // Once both are gone, the bare clone no longer thinks the branch is
     // checked out, so `git branch -D` succeeds; the worktree directory is
     // left as a pile of plain files for the operator.
+    //
+    // Security: the gitfile is *inside the worker's worktree*, so a worker
+    // can rewrite it to point anywhere on disk. We therefore refuse to
+    // recursively delete an admin path that does not resolve to the
+    // canonical `<reposRoot>/<repo_id>.git/worktrees/<name>` shape — without
+    // this check, a malicious worker could turn `cancel --keep-worktree`
+    // into a primitive that deletes any directory the Quay process can
+    // reach.
     if (!existsSync(worktreePath)) return;
     const gitfile = join(worktreePath, ".git");
-    let adminDir: string | null = null;
+    let adminDirRaw: string | null = null;
     try {
       const contents = readFileSync(gitfile, "utf8");
       const m = contents.match(/^gitdir:\s*(.+)$/m);
-      if (m && m[1]) adminDir = m[1].trim();
+      if (m && m[1]) adminDirRaw = m[1].trim();
     } catch {
       // No .git pointer — already detached, treat as a no-op.
     }
     try {
       rmSync(gitfile, { force: true });
     } catch {}
-    if (adminDir !== null) {
-      try {
-        rmSync(adminDir, { recursive: true, force: true });
-      } catch {}
+    if (adminDirRaw !== null) {
+      // Resolve symlinks on both sides before comparison: macOS routes
+      // `/var/folders/...` → `/private/var/folders/...`, and git's gitfile
+      // emits the resolved path. A literal-prefix check on unresolved paths
+      // would reject every legitimate temp-dir layout.
+      const root = canonical(this.reposRoot);
+      const adminAbs = canonical(adminDirRaw);
+      // Allowed shape: `<reposRoot>/<repo_id>.git/worktrees/<name>`. The
+      // first segment under reposRoot must end in `.git`, the second must
+      // be exactly `worktrees`, and there must be a non-empty third
+      // segment. Anything else (a bare-root delete, an escape via `..`, a
+      // symlink target outside reposRoot) is refused. We also re-check
+      // `<repo_id>.git`'s charset against the same identifier rules
+      // bareDir() enforces.
+      if (adminAbs.startsWith(`${root}/`)) {
+        const rel = adminAbs.slice(root.length + 1);
+        const segs = rel.split("/");
+        const repoSeg = segs[0] ?? "";
+        if (
+          segs.length >= 3 &&
+          segs[1] === "worktrees" &&
+          segs[2] !== "" &&
+          segs[2] !== "." &&
+          segs[2] !== ".." &&
+          repoSeg.endsWith(".git") &&
+          /^[A-Za-z0-9._-]+\.git$/.test(repoSeg)
+        ) {
+          try {
+            rmSync(adminAbs, { recursive: true, force: true });
+          } catch {}
+        }
+        // else: outside the canonical layout — leave alone. The next bare-
+        // clone op will lazily prune dangling admin entries.
+      }
     }
   }
 
@@ -303,4 +341,16 @@ function runIn(cwd: string, cmd: string[]): RunResult {
 function decode(buf: Buffer | Uint8Array | undefined): string {
   if (!buf) return "";
   return new TextDecoder().decode(buf);
+}
+
+// Resolve symlinks where they exist; otherwise fall back to the literal
+// resolved path. We accept the no-such-path case because the containment
+// check is also called against admin dirs that may already have been
+// pruned. A non-existent path simply fails the prefix check.
+function canonical(p: string): string {
+  try {
+    return realpathSync(resolve(p));
+  } catch {
+    return resolve(p);
+  }
 }
