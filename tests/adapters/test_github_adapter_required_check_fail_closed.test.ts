@@ -218,6 +218,68 @@ esac
   expect(snap!.checks.items.every((c) => !c.required)).toBe(true);
 });
 
+test("fetchChecks throws on gh exit 8 with empty body (cannot distinguish pending from no-checks)", () => {
+  // Regression: an exit-8 response with no JSON rows is gh saying "checks
+  // are pending but none have reported yet". Returning {items: []} would
+  // let classifyCi's §5 fallback ("no required checks → pass") approve
+  // a task whose CI is still running. Must fail closed so tick retries.
+  installGhStub(`
+case "$*" in
+  *"checks"*"--required"*)
+    echo '[]'
+    exit 0
+    ;;
+  *"checks"*)
+    # Empty body, exit 8.
+    exit 8
+    ;;
+  *"view"*)
+    echo '{"state":"OPEN","headRefOid":"abc","baseRefOid":"def","mergeable":"MERGEABLE","reviewDecision":"NONE","latestReviews":[]}'
+    exit 0
+    ;;
+  *)
+    echo '[]'
+    exit 0
+    ;;
+esac
+`);
+  const { reposRoot, repoId } = makeBareDir();
+  const adapter = new GitHubCliAdapter(reposRoot);
+  expect(() => adapter.prSnapshot(repoId, "quay/branch")).toThrow(
+    /exited 8 \(pending\) with empty body|gh pr checks/i,
+  );
+});
+
+test("fetchRequiredCheckKeys throws on gh exit 8 with empty body", () => {
+  // Same regression for the required-check pass: an empty body on exit 8
+  // would otherwise return an empty required set, which classifyCi reads
+  // as pass — silently approving a PR with pending CI.
+  installGhStub(`
+case "$*" in
+  *"checks"*"--required"*)
+    exit 8
+    ;;
+  *"checks"*)
+    echo '[{"bucket":"pending","workflow":"ci","name":"test","state":"IN_PROGRESS"}]'
+    exit 8
+    ;;
+  *"view"*)
+    echo '{"state":"OPEN","headRefOid":"abc","baseRefOid":"def","mergeable":"MERGEABLE","reviewDecision":"NONE","latestReviews":[]}'
+    exit 0
+    ;;
+  *)
+    echo '[]'
+    exit 0
+    ;;
+esac
+`);
+  const { reposRoot, repoId } = makeBareDir();
+  const adapter = new GitHubCliAdapter(reposRoot);
+  expect(() => adapter.prSnapshot(repoId, "quay/branch")).toThrow(
+    /exited 8 \(pending\) with empty body|gh pr checks --required/i,
+  );
+});
+
 test("fetchChecks treats gh exit 8 (checks pending) as a successful read, not a hard error", () => {
   // Regression: previously any non-zero exit from `gh pr checks` was
   // treated as fatal (or as "no checks" only if stderr happened to say

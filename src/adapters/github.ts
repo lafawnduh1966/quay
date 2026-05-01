@@ -228,16 +228,26 @@ export class GitHubCliAdapter implements GitHubPort {
         `gh pr checks ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
       );
     }
-    // Stdout MAY be empty when there are no checks at all: exit 0 (no
-    // checks configured) and exit 8 (pending, none reported yet) are the
-    // documented empty-body cases. Exit 1 means "at least one check
-    // failed" — an empty body in that branch is anomalous (rate limit,
-    // unrelated transient error that happens to map to exit 1) and must
-    // fail closed.
+    // Empty stdout handling, by exit code:
+    //   exit 0 (no checks at all) — legitimate empty-set; the §5 "no
+    //         required checks → pass" rule is what's intended here.
+    //   exit 1 (at least one check failed) — anomalous empty body
+    //         (rate limit / transient error mapped to exit 1). Fail closed.
+    //   exit 8 (checks pending) — empty body means "checks pending but no
+    //         rows reported yet." That is NOT the same as "no checks";
+    //         routing it to an empty items list would let classifyCi
+    //         conclude pass under the spec §5 fallback. Fail closed by
+    //         throwing — tick logs tick_error and retries on the next
+    //         cycle, by which point gh should emit pending rows.
     if (result.stdout.trim() === "") {
       if (result.exitCode === 1) {
         throw new Error(
           `gh pr checks ${branch} exited 1 with empty body: ${result.stderr.trim() || "<no stderr>"}`,
+        );
+      }
+      if (result.exitCode === 8) {
+        throw new Error(
+          `gh pr checks ${branch} exited 8 (pending) with empty body; cannot distinguish pending-no-rows from no-checks. Tick will retry next cycle.`,
         );
       }
       return { checkSha: null, items: [] };
@@ -317,15 +327,22 @@ export class GitHubCliAdapter implements GitHubPort {
         `gh pr checks --required ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
       );
     }
-    // Empty stdout on exit 0 (no required checks) or exit 8 (pending, none
-    // reported yet) is a legitimate empty-set signal. Exit 1 + empty body
-    // is anomalous (rate limit / transient error) and must fail closed —
-    // otherwise classifyCi would see "no required → pass" on a PR with
-    // failing required CI we couldn't read.
+    // Empty stdout handling, by exit code (mirrors fetchChecks):
+    //   exit 0 — legitimate empty required-check set.
+    //   exit 1 — anomalous (rate limit / transient mapped to exit 1).
+    //            Fail closed; otherwise classifyCi would see "no required
+    //            → pass" on a PR with failing required CI we couldn't read.
+    //   exit 8 — pending with no rows yet. Cannot tell apart from
+    //            "no required checks." Fail closed; tick retries.
     if (result.stdout.trim() === "") {
       if (result.exitCode === 1) {
         throw new Error(
           `gh pr checks --required ${branch} exited 1 with empty body: ${result.stderr.trim() || "<no stderr>"}`,
+        );
+      }
+      if (result.exitCode === 8) {
+        throw new Error(
+          `gh pr checks --required ${branch} exited 8 (pending) with empty body; cannot distinguish pending-no-rows from no-required-checks. Tick will retry next cycle.`,
         );
       }
       return new Set<string>();
