@@ -203,14 +203,44 @@ export class GitHubCliAdapter implements GitHubPort {
       "--json",
       fields,
     ]);
-    if (result.exitCode !== 0) {
-      const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
-      if (msg.includes("no checks") || msg.includes("not found")) {
-        return { checkSha: null, items: [] };
-      }
+    // `gh pr checks` documents three significant exit codes (see
+    // `gh pr checks --help`):
+    //   0 — all checks passed.
+    //   1 — at least one check failed.
+    //   2 — gh CLI / runtime error (auth, network, malformed args, etc.).
+    //   8 — checks are still pending.
+    // Codes 0, 1, and 8 are *successful reads* — `gh` still wrote the JSON
+    // checks array to stdout; the exit code only encodes the overall
+    // verdict. We must parse the body in those cases. Anything else
+    // (notably 2) is a hard failure and must throw so tick logs
+    // `tick_error` rather than transitioning to done.
+    const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
+    // The "no checks at all" stderr signature can come back on any exit
+    // code depending on `gh` version. Recognise it before the exit-code
+    // branching so we don't confuse it with a hard failure.
+    const isKnownNoChecks =
+      msg.includes("no checks") || msg.includes("not found");
+    if (isKnownNoChecks) return { checkSha: null, items: [] };
+    const isReadSuccess =
+      result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 8;
+    if (!isReadSuccess) {
       throw new Error(
-        `gh pr checks ${branch} failed: ${result.stderr.trim()}`,
+        `gh pr checks ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
       );
+    }
+    // Stdout MAY be empty when there are no checks at all: exit 0 (no
+    // checks configured) and exit 8 (pending, none reported yet) are the
+    // documented empty-body cases. Exit 1 means "at least one check
+    // failed" — an empty body in that branch is anomalous (rate limit,
+    // unrelated transient error that happens to map to exit 1) and must
+    // fail closed.
+    if (result.stdout.trim() === "") {
+      if (result.exitCode === 1) {
+        throw new Error(
+          `gh pr checks ${branch} exited 1 with empty body: ${result.stderr.trim() || "<no stderr>"}`,
+        );
+      }
+      return { checkSha: null, items: [] };
     }
     let parsed: unknown;
     try {
@@ -260,29 +290,49 @@ export class GitHubCliAdapter implements GitHubPort {
       "--json",
       fields,
     ]);
-    if (result.exitCode !== 0) {
-      // Fail closed. The empty-set return is reserved for *known* "no
-      // required checks" responses from `gh`. Anything else (auth failure,
-      // CLI version skew, GitHub API outage, rate limit, malformed output)
-      // must throw — otherwise tick's classifyCi sees "no required checks
-      // → pass" and silently approves a PR while required CI is failing.
-      const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
-      const isKnownNoChecks =
-        msg.includes("no checks") ||
-        msg.includes("no check runs") ||
-        msg.includes("no required checks") ||
-        // `gh pr checks --required` with no required checks at all has
-        // historically printed "no required checks reported on this branch"
-        // / "no required checks reported"; cover the prefix too.
-        msg.includes("no required");
-      if (isKnownNoChecks) return new Set<string>();
+    // Same exit-code semantics as fetchChecks: 0/1/8 are read-success
+    // (the JSON body still describes the required-check set, just with a
+    // different overall verdict). Anything else is a hard failure — fail
+    // closed by throwing, so tick logs `tick_error` rather than letting
+    // classifyCi see an empty required set and approve a failing PR.
+    const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
+    // Recognise the legitimate "no required checks" stderr signature
+    // first — it's emitted on multiple non-zero exit codes across `gh`
+    // versions and is the ONE empty-set path classifyCi is allowed to
+    // see. Checked before the exit-code branching so it short-circuits
+    // both the "unknown exit" and "exit 1 + empty body" fail-closed paths.
+    const isKnownNoChecks =
+      msg.includes("no checks") ||
+      msg.includes("no check runs") ||
+      msg.includes("no required checks") ||
+      // `gh pr checks --required` with no required checks at all has
+      // historically printed "no required checks reported on this branch"
+      // / "no required checks reported"; cover the prefix too.
+      msg.includes("no required");
+    if (isKnownNoChecks) return new Set<string>();
+    const isReadSuccess =
+      result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 8;
+    if (!isReadSuccess) {
       throw new Error(
         `gh pr checks --required ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
       );
     }
-    // Successful exit but unparseable JSON is also a fail-closed condition:
-    // `gh` is supposed to emit a JSON array, and a non-array means we cannot
-    // reason about which checks are required.
+    // Empty stdout on exit 0 (no required checks) or exit 8 (pending, none
+    // reported yet) is a legitimate empty-set signal. Exit 1 + empty body
+    // is anomalous (rate limit / transient error) and must fail closed —
+    // otherwise classifyCi would see "no required → pass" on a PR with
+    // failing required CI we couldn't read.
+    if (result.stdout.trim() === "") {
+      if (result.exitCode === 1) {
+        throw new Error(
+          `gh pr checks --required ${branch} exited 1 with empty body: ${result.stderr.trim() || "<no stderr>"}`,
+        );
+      }
+      return new Set<string>();
+    }
+    // Successful read but unparseable JSON is fail-closed: `gh` is supposed
+    // to emit a JSON array, and a non-array means we cannot reason about
+    // which checks are required.
     let parsed: unknown;
     try {
       parsed = JSON.parse(result.stdout);

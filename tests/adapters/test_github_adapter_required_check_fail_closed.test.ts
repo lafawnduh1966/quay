@@ -218,6 +218,104 @@ esac
   expect(snap!.checks.items.every((c) => !c.required)).toBe(true);
 });
 
+test("fetchChecks treats gh exit 8 (checks pending) as a successful read, not a hard error", () => {
+  // Regression: previously any non-zero exit from `gh pr checks` was
+  // treated as fatal (or as "no checks" only if stderr happened to say
+  // so). But `gh pr checks --help` documents exit 8 as "Checks pending"
+  // — a normal pending CI run. Logging `tick_error` for every pending PR
+  // would defeat the §5 polling loop, which is built around classifying
+  // pending rows. The adapter must parse the body and return the rows.
+  installGhStub(`
+case "$*" in
+  *"checks"*"--required"*)
+    echo '[]'
+    exit 0
+    ;;
+  *"checks"*)
+    echo '[{"bucket":"pending","workflow":"ci","name":"test","state":"IN_PROGRESS"}]'
+    exit 8
+    ;;
+  *"view"*)
+    echo '{"state":"OPEN","headRefOid":"abc","baseRefOid":"def","mergeable":"MERGEABLE","reviewDecision":"NONE","latestReviews":[]}'
+    exit 0
+    ;;
+  *)
+    echo '[]'
+    exit 0
+    ;;
+esac
+`);
+  const { reposRoot, repoId } = makeBareDir();
+  const adapter = new GitHubCliAdapter(reposRoot);
+  const snap = adapter.prSnapshot(repoId, "quay/branch");
+  expect(snap).not.toBeNull();
+  expect(snap!.checks.items).toHaveLength(1);
+  expect(snap!.checks.items[0]!.bucket).toBe("pending");
+});
+
+test("fetchChecks treats gh exit 1 (some check failed) as a successful read", () => {
+  // Same rationale as exit 8: exit 1 means "at least one check failed";
+  // `gh` still emits the JSON body. Without parsing it, tick can't tell a
+  // failing check from a hard error.
+  installGhStub(`
+case "$*" in
+  *"checks"*"--required"*)
+    # Required-checks call returns the failing required check.
+    echo '[{"workflow":"ci","name":"test"}]'
+    exit 1
+    ;;
+  *"checks"*)
+    echo '[{"bucket":"fail","workflow":"ci","name":"test","state":"FAILURE"}]'
+    exit 1
+    ;;
+  *"view"*)
+    echo '{"state":"OPEN","headRefOid":"abc","baseRefOid":"def","mergeable":"MERGEABLE","reviewDecision":"NONE","latestReviews":[]}'
+    exit 0
+    ;;
+  *)
+    echo '[]'
+    exit 0
+    ;;
+esac
+`);
+  const { reposRoot, repoId } = makeBareDir();
+  const adapter = new GitHubCliAdapter(reposRoot);
+  const snap = adapter.prSnapshot(repoId, "quay/branch");
+  expect(snap).not.toBeNull();
+  expect(snap!.checks.items).toHaveLength(1);
+  expect(snap!.checks.items[0]!.bucket).toBe("fail");
+  // The required-check pass was also exit 1, but its body was a real JSON
+  // array. The adapter must have parsed it and marked the matching item.
+  expect(snap!.checks.items[0]!.required).toBe(true);
+});
+
+test("fetchChecks throws on gh exit 2 (CLI/runtime error)", () => {
+  // Exit 2 is the documented "gh CLI / runtime error" code — auth, network,
+  // malformed args. There is no JSON body to trust; throw so tick logs
+  // tick_error.
+  installGhStub(`
+case "$*" in
+  *"checks"*)
+    echo 'gh: could not connect to github.com' 1>&2
+    exit 2
+    ;;
+  *"view"*)
+    echo '{"state":"OPEN","headRefOid":"abc","baseRefOid":"def","mergeable":"MERGEABLE","reviewDecision":"NONE","latestReviews":[]}'
+    exit 0
+    ;;
+  *)
+    echo '[]'
+    exit 0
+    ;;
+esac
+`);
+  const { reposRoot, repoId } = makeBareDir();
+  const adapter = new GitHubCliAdapter(reposRoot);
+  expect(() => adapter.prSnapshot(repoId, "quay/branch")).toThrow(
+    /could not connect|gh pr checks/i,
+  );
+});
+
 test("fetchChecks throws on non-array JSON (regression: was silently empty)", () => {
   installGhStub(`
 case "$*" in
