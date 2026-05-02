@@ -8,8 +8,12 @@
 //   - PR existence:       `gh pr list --head <branch> --state all --json number`
 //   - PR open?:           `gh pr list --head <branch> --state open --json number`
 //   - PR snapshot fields: `gh pr view <branch> --json state,headRefOid,baseRefOid,
-//                                                mergeable,reviewDecision,latestReviews,
-//                                                reviews,comments`
+//                                                mergeable,reviewDecision,latestReviews`
+//   - Inline review comments (CHANGES_REQUESTED only):
+//                         `gh api graphql -f query='... PullRequestReview.comments ...'`
+//                         keyed by the review's node id from `latestReviews`. Folded
+//                         into `latestReview.comments` so the worker's respawn artifact
+//                         actually carries the actionable feedback.
 //   - Required-check set: `gh pr checks <branch> --json bucket,workflow,name,state`
 //   - Closing the PR:     `gh pr close <branch>`  (idempotent: tolerates "already closed"
 //                                                  and "no PR" by inspecting stderr)
@@ -191,6 +195,8 @@ export class GitHubCliAdapter implements GitHubPort {
         `gh pr view returned unparseable JSON for ${branch}: ${(err as Error).message}`,
       );
     }
+    const baseLatestReview = extractLatestReview(parsed);
+    const latestReview = this.enrichWithInlineComments(repoId, baseLatestReview);
     return {
       state: mapPrState(parsed.state),
       headSha: String(parsed.headRefOid ?? ""),
@@ -199,8 +205,102 @@ export class GitHubCliAdapter implements GitHubPort {
           ? String(parsed.baseRefOid)
           : null,
       mergeable: mapMergeable(parsed.mergeable),
-      latestReview: extractLatestReview(parsed),
+      latestReview,
     };
+  }
+
+  // For CHANGES_REQUESTED reviews, the actionable feedback usually lives in
+  // inline review comments — `gh pr view --json latestReviews` only surfaces
+  // the (often empty) review summary body. Without this enrichment, the
+  // worker gets respawned with an empty `review_comments` artifact and no
+  // idea what the reviewer asked for.
+  //
+  // Fetch the review's inline comments via the GraphQL API (keyed by the
+  // review's node id, which is what `gh pr view` returns) and fold them
+  // into `comments` as a deterministic markdown block. We only enrich
+  // CHANGES_REQUESTED reviews — other decisions don't trigger a respawn,
+  // so there's no caller that would read the result.
+  //
+  // Fail closed: if the inline-comments fetch errors (rate limit, auth,
+  // malformed response), throw so tick logs `tick_error` and retries.
+  // Returning a partial snapshot would mean respawning the worker with
+  // less feedback than the reviewer actually wrote.
+  private enrichWithInlineComments(
+    repoId: string,
+    base: PrLatestReview,
+  ): PrLatestReview {
+    if (base.decision !== "CHANGES_REQUESTED") return base;
+    if (base.latestReviewId === null) return base;
+    const inline = this.fetchReviewInlineComments(repoId, base.latestReviewId);
+    if (inline.length === 0 && base.comments.trim() === "") return base;
+    return { ...base, comments: composeReviewFeedback(base.comments, inline) };
+  }
+
+  private fetchReviewInlineComments(
+    repoId: string,
+    reviewNodeId: string,
+  ): InlineReviewComment[] {
+    // GraphQL keyed on the review's node id (the form `gh pr view` returns).
+    // The REST endpoint at /pulls/<n>/reviews/<numeric-id>/comments would
+    // require translating to the numeric databaseId first; the GraphQL
+    // `node(id: $id)` form doesn't, so it's the cleanest path.
+    const query =
+      "query($id: ID!) { node(id: $id) { ... on PullRequestReview { " +
+      "comments(first: 100) { nodes { path line originalLine body } } } } }";
+    const result = this.run(repoId, [
+      "gh",
+      "api",
+      "graphql",
+      "-f",
+      `query=${query}`,
+      "-F",
+      `id=${reviewNodeId}`,
+    ]);
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `gh api graphql (review comments) failed for review ${reviewNodeId}: ${result.stderr.trim() || result.stdout.trim()}`,
+      );
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+    } catch (err) {
+      throw new Error(
+        `gh api graphql (review comments) returned unparseable JSON for review ${reviewNodeId}: ${(err as Error).message}`,
+      );
+    }
+    // gh forwards GraphQL `errors` arrays even on exit 0 if the query
+    // partially-failed against a permissions-restricted node. Surface that
+    // as a hard failure rather than silently returning an empty list.
+    if (Array.isArray(parsed.errors) && parsed.errors.length > 0) {
+      const summary = parsed.errors
+        .map((e) => {
+          const eo = (e ?? {}) as Record<string, unknown>;
+          return String(eo.message ?? JSON.stringify(eo));
+        })
+        .join("; ");
+      throw new Error(
+        `gh api graphql (review comments) returned errors for review ${reviewNodeId}: ${summary}`,
+      );
+    }
+    const data = (parsed.data ?? {}) as Record<string, unknown>;
+    const node = (data.node ?? {}) as Record<string, unknown>;
+    const commentsField = (node.comments ?? {}) as Record<string, unknown>;
+    const nodes = Array.isArray(commentsField.nodes) ? commentsField.nodes : [];
+    const items: InlineReviewComment[] = [];
+    for (const row of nodes) {
+      const r = (row ?? {}) as Record<string, unknown>;
+      const path = String(r.path ?? "");
+      const line =
+        typeof r.line === "number"
+          ? r.line
+          : typeof r.originalLine === "number"
+            ? r.originalLine
+            : null;
+      const body = String(r.body ?? "");
+      items.push({ path, line, body });
+    }
+    return items;
   }
 
   // Lightweight head-SHA read used by `prSnapshot` to bracket the checks
@@ -537,8 +637,41 @@ function mapBucket(raw: unknown): PrCheckBucket {
   if (s === "fail") return "fail";
   if (s === "pending") return "pending";
   if (s === "skipping") return "skipping";
-  if (s === "cancelled" || s === "canceled") return "cancelled";
+  // `gh pr checks --json bucket` reports cancelled checks as the literal
+  // "cancel" (its own bucket vocabulary) — neither "cancelled" nor "canceled".
+  // The conclusion column on the same row is "cancelled" (US English) or
+  // "canceled" (recent gh versions). Recognise all three so a cancelled
+  // required check counts as CI failure (`classifySet` → "fail") rather than
+  // falling through to "pending" and stranding the task.
+  if (s === "cancel" || s === "cancelled" || s === "canceled") return "cancelled";
   return "pending";
+}
+
+interface InlineReviewComment {
+  path: string;
+  line: number | null;
+  body: string;
+}
+
+// Compose the reviewer-summary body and the per-line inline comments into a
+// single markdown blob. Worker reads the resulting `review_comments`
+// artifact verbatim, so the layout is the contract.
+function composeReviewFeedback(
+  body: string,
+  inline: InlineReviewComment[],
+): string {
+  const trimmedBody = body.trim();
+  if (inline.length === 0) return trimmedBody;
+  const formatted = inline
+    .map((c) => {
+      const loc = c.line !== null ? `${c.path}:${c.line}` : c.path;
+      const trimmed = c.body.trim();
+      return trimmed === "" ? `- ${loc}` : `- ${loc} — ${trimmed}`;
+    })
+    .join("\n");
+  const header = `Inline review comments (${inline.length}):`;
+  if (trimmedBody === "") return `${header}\n${formatted}`;
+  return `${trimmedBody}\n\n${header}\n${formatted}`;
 }
 
 function extractLatestReview(parsed: Record<string, unknown>): PrLatestReview {

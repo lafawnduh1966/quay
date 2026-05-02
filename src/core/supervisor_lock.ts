@@ -25,11 +25,9 @@
 // the next acquirer reclaims the file. This bounds the worst case of a
 // hung-then-killed tick blocking `quay cancel` indefinitely.
 import {
-  closeSync,
   existsSync,
   linkSync,
   mkdirSync,
-  openSync,
   readFileSync,
   renameSync,
   unlinkSync,
@@ -182,25 +180,54 @@ export class FileSupervisorLock implements SupervisorLock {
     return this.takeover(existing);
   }
 
-  // Try `O_CREAT | O_EXCL` write. Returns true if we created the file (and
-  // thus own the lock). Returns false if the file already exists. Anything
-  // else throws.
+  // Atomically create the lockfile so it carries our owner payload from the
+  // instant it exists. Returns true if we now own the lock; false if the
+  // canonical path already had a file.
+  //
+  // The earlier `openSync(.., "wx")` then `writePayload` sequence had a
+  // crash window: the file existed empty for an instant. A process death
+  // there leaves a permanently-unrecoverable lockfile because `tryAcquire`
+  // refuses to reclaim a lock whose payload won't parse — so future tick
+  // and cancel calls hang until an operator removes the file by hand.
+  //
+  // Same scratch+hard-link technique we already use for the takeover
+  // mutex: write the payload to a private scratch file in the same
+  // directory (so `linkSync` stays within one filesystem and is therefore
+  // atomic), then `linkSync(scratch, canonical)`. POSIX hard-link is
+  // atomic — exactly one of N concurrent linkers wins; the others see
+  // EEXIST. When the link succeeds the canonical path is a second
+  // hardlink to the scratch's inode and already carries the full payload;
+  // there is no observable empty state. Drop scratch afterwards (the
+  // canonical hardlink keeps the inode alive).
   private createExclusive(): boolean {
     mkdirSync(dirname(this.lockfilePath), { recursive: true });
-    let fd: number;
+    const scratch = `${this.lockfilePath}.init-${process.pid}-${randomBytes(6).toString("hex")}`;
+    writeFileSync(
+      scratch,
+      JSON.stringify({ pid: process.pid, taken_at_ms: this.now() }),
+    );
+    let linked = false;
     try {
-      // 'wx' = O_CREAT | O_EXCL | O_WRONLY. Atomic against concurrent acquires.
-      fd = openSync(this.lockfilePath, "wx");
+      linkSync(scratch, this.lockfilePath);
+      linked = true;
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
-      throw err;
+      if ((err as NodeJS.ErrnoException).code !== "EEXIST") {
+        try {
+          unlinkSync(scratch);
+        } catch {}
+        throw err;
+      }
+      // EEXIST: another acquirer landed first. Fall through; caller will
+      // read the existing payload and decide between live-owner-bail and
+      // stale-takeover.
     }
+    // Drop the private scratch regardless of outcome. If linked, the
+    // canonical lockfile keeps the inode (and our payload) alive; if not,
+    // scratch is just leftover garbage to clean up.
     try {
-      writePayload(fd, { pid: process.pid, taken_at_ms: this.now() });
-    } finally {
-      closeSync(fd);
-    }
-    return true;
+      unlinkSync(scratch);
+    } catch {}
+    return linked;
   }
 
   // Stale-lock takeover, race-free against an arbitrary number of
@@ -397,11 +424,6 @@ export class FileSupervisorLock implements SupervisorLock {
       // best-effort; the next acquirer's stale-PID logic recovers anyway.
     }
   }
-}
-
-function writePayload(fd: number, payload: LockfilePayload): void {
-  const body = JSON.stringify(payload);
-  writeFileSync(fd, body, { encoding: "utf8" });
 }
 
 function readPayloadFromPath(path: string): LockfilePayload | null {
