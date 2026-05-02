@@ -5,11 +5,26 @@
 // Prompt handling: `<worktree>/.quay-prompt.md` is written before spawn. The
 // agent invocation is a template; `{prompt_file}` is replaced with the
 // absolute path to the prompt file before being passed to the shell.
-import { writeFileSync } from "node:fs";
+//
+// Pane log capture: after `new-session`, the adapter runs
+// `tmux pipe-pane -o "cat >> <worktree>/.quay-session.log"` (spec §12) so
+// every byte the agent prints lands in a file the classifier and tick's
+// stale check can read. The log file's mtime is the freshness signal: a
+// worker that's actively producing output has a recent mtime; a hung worker
+// (or one that died before tmux noticed) has an old mtime. Without this
+// pipe, every long-running task gets stale-killed past the staleness
+// threshold even when actively producing output.
+import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { TmuxPort, TmuxSpawnInput } from "../ports/tmux.ts";
 
 const PROMPT_FILE = ".quay-prompt.md";
+const SESSION_LOG_FILE = ".quay-session.log";
+// Cap log artifact reads at a few MB so a runaway agent that never exits
+// doesn't push gigabytes through the artifact store. The tail bias matches
+// "what is the worker doing right now?" — the most recent output is what
+// the classifier and operator care about.
+const MAX_LOG_BYTES = 4 * 1024 * 1024;
 
 export class TmuxAdapter implements TmuxPort {
   spawn(input: TmuxSpawnInput): void {
@@ -45,6 +60,51 @@ export class TmuxAdapter implements TmuxPort {
         `tmux new-session for ${input.sessionName} failed (exit ${result.exitCode}): ${stderr.trim()}`,
       );
     }
+
+    // Configure pane piping AFTER the session exists. The `-o` flag is the
+    // "open" side of the toggle (start piping if not already piping). We
+    // build the inner shell command via `shellQuote` for the same reason
+    // we quote the agent invocation: the worktree path is Quay-controlled
+    // but goes through `sh -c` and we want safe behavior even if a future
+    // path scheme introduces metacharacters.
+    const logPath = join(input.worktreePath, SESSION_LOG_FILE);
+    const pipeCommand = `cat >> ${shellQuote(logPath)}`;
+    // Target the session's active pane explicitly. tmux's `=<name>` exact-
+    // match prefix is a target-SESSION construct, but pipe-pane wants a
+    // target-PANE. The canonical form is `<session>:<window>.<pane>`; for
+    // a freshly created `new-session -d` the only pane is the default
+    // window's index-0 pane.
+    const pipe = Bun.spawnSync({
+      cmd: [
+        "tmux",
+        "pipe-pane",
+        "-o",
+        "-t",
+        `${input.sessionName}:0.0`,
+        pipeCommand,
+      ],
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+    if (pipe.exitCode !== 0) {
+      // If pipe-pane fails the session is still spawned and the agent is
+      // running — but we'd silently lose the freshness signal that drives
+      // tick's stale-kill check, leading to long-lived workers being
+      // killed as stale at the threshold. Surface this as a hard spawn
+      // failure so the spawn-substrate-failed path takes over.
+      const stderr = new TextDecoder().decode(pipe.stderr);
+      // Best-effort: kill the session we just created so we don't leak it.
+      try {
+        Bun.spawnSync({
+          cmd: ["tmux", "kill-session", "-t", `=${input.sessionName}`],
+          stdout: "ignore",
+          stderr: "ignore",
+        });
+      } catch {}
+      throw new Error(
+        `tmux pipe-pane for ${input.sessionName} failed (exit ${pipe.exitCode}): ${stderr.trim()}`,
+      );
+    }
   }
 
   isAlive(sessionName: string): boolean {
@@ -67,16 +127,58 @@ export class TmuxAdapter implements TmuxPort {
     });
   }
 
-  collectLog(_sessionName: string): string | null {
-    // Pane log capture is best-effort and not needed for liveness. Real
-    // operator-side log collection is wired in a later refinement; tests use
-    // the FakeTmux log capture path.
-    return null;
+  collectLog(_sessionName: string, worktreePath: string): string | null {
+    // The pipe-pane configured at spawn writes every byte the agent prints
+    // to <worktreePath>/.quay-session.log. Survives the session's death
+    // (the file is independent of tmux state), so post-mortem classifier
+    // and cancel-finalizer reads still work.
+    const logPath = join(worktreePath, SESSION_LOG_FILE);
+    if (!existsSync(logPath)) return null;
+    let stat;
+    try {
+      stat = statSync(logPath);
+    } catch {
+      return null;
+    }
+    if (stat.size === 0) return null;
+    try {
+      if (stat.size <= MAX_LOG_BYTES) {
+        return readFileSync(logPath, "utf8");
+      }
+      // Tail-read: bias toward the most recent output, which is what the
+      // classifier and the operator actually want to see for "what was
+      // this worker doing when it died?"
+      const fd = Bun.file(logPath);
+      const slice = fd.slice(stat.size - MAX_LOG_BYTES);
+      return new TextDecoder().decode(
+        new Uint8Array(slice.arrayBuffer() as unknown as ArrayBufferLike),
+      );
+    } catch {
+      return null;
+    }
   }
 
-  logFreshness(_sessionName: string, spawnedAt: string): string {
-    // Without a captured log, the freshest signal we have is spawn time.
-    return spawnedAt;
+  logFreshness(
+    _sessionName: string,
+    worktreePath: string,
+    spawnedAt: string,
+  ): string {
+    // The log mtime is the freshness signal: stale-kill fires when the
+    // most recent output is older than `staleness_threshold_seconds`. For
+    // a freshly spawned worker that hasn't written anything yet, no log
+    // file exists; fall back to spawned_at so the freshness window starts
+    // from spawn (not from epoch).
+    const logPath = join(worktreePath, SESSION_LOG_FILE);
+    let stat;
+    try {
+      stat = statSync(logPath);
+    } catch {
+      return spawnedAt;
+    }
+    // Empty log file (pipe-pane created it but nothing has been printed
+    // yet): same case as "no log yet" — use spawned_at as the floor.
+    if (stat.size === 0) return spawnedAt;
+    return new Date(stat.mtimeMs).toISOString();
   }
 }
 

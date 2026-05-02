@@ -372,8 +372,19 @@ export class GitHubCliAdapter implements GitHubPort {
     // The "no checks at all" stderr signature can come back on any exit
     // code depending on `gh` version. Recognise it before the exit-code
     // branching so we don't confuse it with a hard failure.
+    //
+    // Crucial: we ONLY accept check-scoped phrasings ("no checks
+    // reported", "no check runs", etc.). A bare `not found` substring is
+    // NOT enough — it would also swallow `Could not resolve to a
+    // PullRequest with the number ... Not Found` (GraphQL 404 from a
+    // wrong repo / auth / discovery failure), which would then route a
+    // genuine API error into "no required checks → pass" and silently
+    // transition a PR to done. Generic 404s must fall through to the
+    // exit-code check and surface as a thrown error → tick_error.
     const isKnownNoChecks =
-      msg.includes("no checks") || msg.includes("not found");
+      msg.includes("no checks") ||
+      msg.includes("no check runs") ||
+      msg.includes("no required checks");
     if (isKnownNoChecks) return { checkSha: null, items: [] };
     const isReadSuccess =
       result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 8;

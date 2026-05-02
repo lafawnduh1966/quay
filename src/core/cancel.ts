@@ -284,7 +284,7 @@ export function runCancelFinalizer(deps: CancelDeps, taskId: string): void {
       const sessionName =
         latest.tmux_session ??
         `quay-task-${row.tmux_id}-${latest.attempt_number}`;
-      const log = deps.tmux.collectLog(sessionName);
+      const log = deps.tmux.collectLog(sessionName, row.worktree_path);
       if (log !== null && log.length > 0) {
         try {
           deps.artifactStore.writeArtifact({

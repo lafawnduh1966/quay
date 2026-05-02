@@ -441,7 +441,7 @@ function processRunningTask(
       deps.tmux.kill(attempt.tmux_session);
       return { task_id: task.task_id, action: "kill_intent_set" };
     }
-    const intent = detectKillIntent(deps, attempt, options);
+    const intent = detectKillIntent(deps, task, attempt, options);
     if (intent !== null) {
       setKillIntent(deps, task.task_id, attempt.attempt_id, intent);
       fireFailpoint("after_kill_intent_commit");
@@ -1271,6 +1271,7 @@ function loadLatestAttempt(db: DB, taskId: string): CurrentAttemptRow | null {
 
 function detectKillIntent(
   deps: TickDeps,
+  task: { worktree_path: string },
   attempt: CurrentAttemptRow,
   options: TickOptions,
 ): "wall_clock" | "stale" | null {
@@ -1282,7 +1283,11 @@ function detectKillIntent(
   if (nowMs - spawnedMs > maxAttemptSeconds * 1000) return "wall_clock";
 
   const freshMs = Date.parse(
-    deps.tmux.logFreshness(attempt.tmux_session, attempt.spawned_at),
+    deps.tmux.logFreshness(
+      attempt.tmux_session,
+      task.worktree_path,
+      attempt.spawned_at,
+    ),
   );
   const stalenessSeconds =
     options.stalenessThresholdSeconds ?? DEFAULT_STALENESS_THRESHOLD_SECONDS;
@@ -1332,7 +1337,10 @@ function finalizeKillIntent(
 ): void {
   if (attempt.tmux_session) {
     try {
-      const log = deps.tmux.collectLog(attempt.tmux_session);
+      const log = deps.tmux.collectLog(
+        attempt.tmux_session,
+        task.worktree_path,
+      );
       if (log !== null) {
         deps.artifactStore.writeArtifact({
           taskId: task.task_id,

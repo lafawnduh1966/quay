@@ -185,7 +185,7 @@ function collectSessionLog(
 ): void {
   let log: string | null;
   try {
-    log = deps.tmux.collectLog(sessionName);
+    log = deps.tmux.collectLog(sessionName, task.worktree_path);
   } catch {
     return;
   }

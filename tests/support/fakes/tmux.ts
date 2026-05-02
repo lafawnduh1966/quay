@@ -36,12 +36,16 @@ export class FakeTmux implements TmuxPort {
     this.liveSessions.delete(sessionName);
   }
 
-  collectLog(sessionName: string): string | null {
+  collectLog(sessionName: string, _worktreePath: string): string | null {
     this.collectLogCalls.push(sessionName);
     return this.sessionLogs.get(sessionName) ?? null;
   }
 
-  logFreshness(sessionName: string, spawnedAt: string): string {
+  logFreshness(
+    sessionName: string,
+    _worktreePath: string,
+    spawnedAt: string,
+  ): string {
     this.logFreshnessCalls.push(sessionName);
     return this.sessionFreshness.get(sessionName) ?? spawnedAt;
   }

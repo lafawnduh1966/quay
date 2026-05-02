@@ -143,25 +143,11 @@ export class SlackAdapter implements SlackPort {
             },
             body: JSON.stringify(payload),
           };
-    // Bun supports synchronous `fetch` only via `await`; we run the call
-    // inside `Atomics.wait`-free deasync via `Bun.spawnSync`-style? No — we
-    // just await within a synchronous wrapper through `Bun.serve`-free
-    // approach: Slack must be called async-only. Refactor: callSync returns
-    // a Promise via `then` chain blocked using `await`-on-thenable.
-    // Bun gives us `await` only inside async; the SlackPort interface is
-    // synchronous, so we use `bun:ffi`-free synchronous `fetch` via the
-    // `--experimental-fetch-sync` path is unavailable. Instead, surface the
-    // call as truly synchronous by spawning a child Bun process.
-    //
-    // In practice: tick is a one-shot CLI invocation, and a child-process
-    // round-trip per Slack call adds milliseconds — acceptable. The
-    // alternative is to redesign SlackPort as async, which ripples through
-    // every tick handler. We choose the small synchronous-shim cost over the
-    // large refactor.
-    //
-    // The token MUST NOT be passed as argv — `ps`/`/proc/<pid>/cmdline`
-    // would expose it for the lifetime of the child process. Pass it via
-    // an inherited environment variable instead, scoped to this child.
+    // SlackPort is synchronous (every tick handler relies on it) but Bun's
+    // `fetch` is async-only, so we run the HTTP call in a child Bun
+    // process and `spawnSync`-wait on it. The token is passed via the
+    // child's env, never argv — argv is visible in `ps`/`/proc/<pid>/cmdline`
+    // for the child's lifetime.
     const result = Bun.spawnSync({
       cmd: [
         process.execPath,
