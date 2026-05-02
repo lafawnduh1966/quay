@@ -378,29 +378,86 @@ export class FileSupervisorLock implements SupervisorLock {
   }
 
   // Examine an existing mutex; if its owner is dead beyond the grace
-  // window, unlink it. Returns true iff cleanup happened (caller should
-  // retry the link); false iff the mutex is still legitimately held.
+  // window, claim removal of the inode we observed (not whatever inode
+  // currently happens to live at mutexPath). Returns true iff cleanup
+  // happened (caller should retry the link); false iff the mutex is
+  // still legitimately held.
   //
-  // No ownerless-fallback path: the hard-link acquisition guarantees
-  // the mutex always has owner content from the instant it exists, so
-  // an empty mutex would indicate filesystem corruption. We treat a
-  // missing/unparseable owner as "leave alone" so a future hand-edit
-  // doesn't get auto-clobbered; operator intervention is the explicit
-  // recovery for that very rare case.
+  // The previous implementation read the mutex by path, decided it was
+  // stale, then `unlinkSync(mutexPath)` — without re-verifying that
+  // the path still pointed to the same stale payload. Two contending
+  // reclaimers could both pass the staleness check on the original
+  // dead mutex; one would unlink it, link a fresh mutex, and the other
+  // would then unlink that *fresh* mutex by path — leaving both
+  // contenders inside the takeover critical section.
+  //
+  // The fix: atomically take ownership of whatever inode currently
+  // lives at mutexPath via `renameSync(mutexPath, asidePath)`. After
+  // that rename, asidePath is private to us and no other process can
+  // mutate it; the canonical mutex path is empty. We re-verify the
+  // moved-aside payload before deciding, so the staleness check is
+  // anchored to the inode we actually moved (not whatever the path
+  // pointed to in our pre-mutex read). If the moved payload turns out
+  // to still be live (the mutex was freshened between the pre-read
+  // and our rename), we attempt to put it back via `linkSync` so the
+  // legitimate owner's mutex isn't lost.
   private tryReclaimMutex(mutexPath: string): boolean {
-    const owner = readPayloadFromPath(mutexPath);
-    if (owner === null) {
-      // Mutex unlinked between our linkSync and our read — caller
-      // should retry. (`readPayloadFromPath` returns null on ENOENT.)
-      if (!existsSync(mutexPath)) return true;
-      // File exists but is unparseable. Leave alone — operator
-      // intervention required.
+    const aside = `${mutexPath}.reclaim-${process.pid}-${randomBytes(6).toString("hex")}`;
+    try {
+      renameSync(mutexPath, aside);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      // Mutex already gone (possibly because another reclaimer moved
+      // it aside, or a normal release ran concurrently). Either way
+      // canonical is empty; the caller's link retry is what we want.
+      if (code === "ENOENT") return true;
+      // Unexpected error (permissions, FS issue): refuse takeover so
+      // we don't escalate into corrupt territory. Operator can
+      // investigate the lockfile dir.
       return false;
     }
-    if (this.isAlive(owner.pid)) return false;
-    if (this.now() - owner.taken_at_ms < this.staleMutexMs) return false;
+
+    const owner = readPayloadFromPath(aside);
+    if (owner === null) {
+      // Unparseable payload. We've already moved it aside, so canonical
+      // is empty regardless. Drop the aside copy and let the caller's
+      // retry win the link.
+      try {
+        unlinkSync(aside);
+      } catch {}
+      return true;
+    }
+    const isLiveOwner =
+      this.isAlive(owner.pid) ||
+      this.now() - owner.taken_at_ms < this.staleMutexMs;
+    if (isLiveOwner) {
+      // The owner we moved aside is legitimately still holding the
+      // mutex. Our rename removed it from the canonical path, so we
+      // must put it back — but we can't `renameSync(aside, mutex)`
+      // because that would clobber a third-party fresh mutex that
+      // happened to land in the empty window. `linkSync` is conditional
+      // (EEXIST on existing path); use it so the put-back is safe
+      // against third-party intrusion.
+      try {
+        linkSync(aside, mutexPath);
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST") {
+          // Best-effort: drop our aside and bail. The legitimate
+          // owner's mutex content is lost in this exotic case;
+          // tick will surface this on its next observation.
+        }
+      }
+      try {
+        unlinkSync(aside);
+      } catch {}
+      return false;
+    }
+    // Owner was actually stale (consistent with our pre-mutex read).
+    // Aside holds the dead inode; canonical is empty. Drop aside and
+    // let the caller's link retry seize the empty canonical.
     try {
-      unlinkSync(mutexPath);
+      unlinkSync(aside);
     } catch {}
     return true;
   }

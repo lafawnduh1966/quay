@@ -368,23 +368,43 @@ export class GitHubCliAdapter implements GitHubPort {
     // verdict. We must parse the body in those cases. Anything else
     // (notably 2) is a hard failure and must throw so tick logs
     // `tick_error` rather than transitioning to done.
-    const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
-    // The "no checks at all" stderr signature can come back on any exit
-    // code depending on `gh` version. Recognise it before the exit-code
-    // branching so we don't confuse it with a hard failure.
-    //
-    // Crucial: we ONLY accept check-scoped phrasings ("no checks
-    // reported", "no check runs", etc.). A bare `not found` substring is
-    // NOT enough — it would also swallow `Could not resolve to a
-    // PullRequest with the number ... Not Found` (GraphQL 404 from a
-    // wrong repo / auth / discovery failure), which would then route a
-    // genuine API error into "no required checks → pass" and silently
-    // transition a PR to done. Generic 404s must fall through to the
-    // exit-code check and surface as a thrown error → tick_error.
+    // Parse a non-empty stdout as JSON BEFORE checking any "no checks"
+    // hint. If gh emitted a valid JSON array, that array drives the
+    // outcome — even if a check inside it has a workflow or name
+    // containing the substring "no checks" (e.g. a CI workflow literally
+    // named "No checks required"). A combined-stdout-and-stderr substring
+    // match would otherwise short-circuit a real check set to empty,
+    // which the spec §5 fallback then approves as pass.
+    const stdoutTrim = result.stdout.trim();
+    const parsedArray = tryParseJsonArray(stdoutTrim);
+    if (parsedArray !== null) {
+      const isReadSuccess =
+        result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 8;
+      if (!isReadSuccess) {
+        throw new Error(
+          `gh pr checks ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
+        );
+      }
+      const requiredKeys = this.fetchRequiredCheckKeys(repoId, branch);
+      const items: PrCheck[] = markRequired(
+        parsedArray.map((row) => mapCheckRow(row)),
+        requiredKeys,
+      );
+      return { checkSha: null, items };
+    }
+
+    // No usable JSON body. The "no checks" empty-set signal must come
+    // from stderr — gh's stable channel for that message. We allow stdout
+    // matching too, but ONLY when stdout failed to parse as JSON above
+    // (so a non-empty JSON array is never bypassed). Generic 404s ("Not
+    // Found") are not in the matcher and fall through to the exit-code
+    // check.
+    const stderrLower = result.stderr.toLowerCase();
+    const stdoutNoChecksHint =
+      stdoutTrim !== "" &&
+      noChecksPhraseIn(stdoutTrim.toLowerCase());
     const isKnownNoChecks =
-      msg.includes("no checks") ||
-      msg.includes("no check runs") ||
-      msg.includes("no required checks");
+      noChecksPhraseIn(stderrLower) || stdoutNoChecksHint;
     if (isKnownNoChecks) return { checkSha: null, items: [] };
     const isReadSuccess =
       result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 8;
@@ -404,7 +424,7 @@ export class GitHubCliAdapter implements GitHubPort {
     //         conclude pass under the spec §5 fallback. Fail closed by
     //         throwing — tick logs tick_error and retries on the next
     //         cycle, by which point gh should emit pending rows.
-    if (result.stdout.trim() === "") {
+    if (stdoutTrim === "") {
       if (result.exitCode === 1) {
         throw new Error(
           `gh pr checks ${branch} exited 1 with empty body: ${result.stderr.trim() || "<no stderr>"}`,
@@ -417,44 +437,14 @@ export class GitHubCliAdapter implements GitHubPort {
       }
       return { checkSha: null, items: [] };
     }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(result.stdout);
-    } catch (err) {
-      throw new Error(
-        `gh pr checks returned unparseable JSON for ${branch}: ${(err as Error).message}`,
-      );
-    }
-    if (!Array.isArray(parsed)) {
-      // Fail closed: a non-array response from `gh pr checks` is not a
-      // documented "no checks" signal, so we cannot safely conclude the PR
-      // has zero checks. Surfacing this as a thrown error lets tick log
-      // `tick_error` and skip the transition rather than approving by
-      // default.
-      throw new Error(
-        `gh pr checks returned non-array JSON for ${branch}: ${result.stdout.slice(0, 200)}`,
-      );
-    }
-
-    // Resolve required-check identity from a second `gh pr checks --required`
-    // call. Match by (workflow, name) since `gh` does not expose a stable id.
-    const requiredKeys = this.fetchRequiredCheckKeys(repoId, branch);
-    const items: PrCheck[] = markRequired(
-      parsed.map((row) => mapCheckRow(row)),
-      requiredKeys,
+    // stdout non-empty but neither valid JSON nor a known "no checks"
+    // text message — fail closed. (Note: `gh pr checks --json` is the
+    // only place we read the per-row check SHA; `checkSha` is always
+    // null at this layer and is rewritten by `prSnapshot` from a
+    // `gh pr view --json headRefOid` bracket so the stale-SHA gate works.)
+    throw new Error(
+      `gh pr checks returned unparseable / non-array JSON for ${branch}: ${stdoutTrim.slice(0, 200)}`,
     );
-    return {
-      // `gh pr checks --json` does not surface the per-row commit SHA. The
-      // stale-SHA decision is therefore made one level up in `prSnapshot`,
-      // which brackets this call with two `gh pr view --json headRefOid`
-      // reads and rewrites `checkSha` to the head-before SHA + `headSha` to
-      // the head-after SHA. Direct callers of `fetchChecks` (e.g. the
-      // convenience `prCheckStatus` method) get `null`, which preserves the
-      // previous behavior — `prCheckStatus` does not run the stale-SHA
-      // gate.
-      checkSha: null,
-      items,
-    };
   }
 
   private fetchRequiredCheckKeys(repoId: string, branch: string): Set<string> {
@@ -468,25 +458,45 @@ export class GitHubCliAdapter implements GitHubPort {
       "--json",
       fields,
     ]);
-    // Same exit-code semantics as fetchChecks: 0/1/8 are read-success
-    // (the JSON body still describes the required-check set, just with a
-    // different overall verdict). Anything else is a hard failure — fail
-    // closed by throwing, so tick logs `tick_error` rather than letting
-    // classifyCi see an empty required set and approve a failing PR.
-    const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
-    // Recognise the legitimate "no required checks" stderr signature
-    // first — it's emitted on multiple non-zero exit codes across `gh`
-    // versions and is the ONE empty-set path classifyCi is allowed to
-    // see. Checked before the exit-code branching so it short-circuits
-    // both the "unknown exit" and "exit 1 + empty body" fail-closed paths.
+    // Same exit-code semantics as fetchChecks: 0/1/8 are read-success.
+    // Parse a non-empty stdout as JSON FIRST. A required-check entry
+    // whose workflow or name happens to contain the substring "no
+    // checks" / "no required" must NOT short-circuit a real required
+    // set to empty.
+    const stdoutTrim = result.stdout.trim();
+    const parsedArray = tryParseJsonArray(stdoutTrim);
+    if (parsedArray !== null) {
+      const isReadSuccess =
+        result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 8;
+      if (!isReadSuccess) {
+        throw new Error(
+          `gh pr checks --required ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
+        );
+      }
+      const keys = new Set<string>();
+      for (const row of parsedArray) {
+        const r = (row ?? {}) as Record<string, unknown>;
+        const workflow =
+          r.workflow === null || r.workflow === undefined
+            ? ""
+            : String(r.workflow);
+        const name = String(r.name ?? "");
+        keys.add(
+          requiredKeyOf({ workflow: workflow === "" ? null : workflow, name }),
+        );
+      }
+      return keys;
+    }
+
+    // No usable JSON body. The "no required checks" empty-set signal
+    // must come from stderr (gh's stable channel for that message), or
+    // from a stdout body that failed JSON parsing — never from a
+    // matching substring inside a successfully-parsed array.
+    const stderrLower = result.stderr.toLowerCase();
+    const stdoutNoChecksHint =
+      stdoutTrim !== "" && noRequiredChecksPhraseIn(stdoutTrim.toLowerCase());
     const isKnownNoChecks =
-      msg.includes("no checks") ||
-      msg.includes("no check runs") ||
-      msg.includes("no required checks") ||
-      // `gh pr checks --required` with no required checks at all has
-      // historically printed "no required checks reported on this branch"
-      // / "no required checks reported"; cover the prefix too.
-      msg.includes("no required");
+      noRequiredChecksPhraseIn(stderrLower) || stdoutNoChecksHint;
     if (isKnownNoChecks) return new Set<string>();
     const isReadSuccess =
       result.exitCode === 0 || result.exitCode === 1 || result.exitCode === 8;
@@ -495,14 +505,8 @@ export class GitHubCliAdapter implements GitHubPort {
         `gh pr checks --required ${branch} failed (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
       );
     }
-    // Empty stdout handling, by exit code (mirrors fetchChecks):
-    //   exit 0 — legitimate empty required-check set.
-    //   exit 1 — anomalous (rate limit / transient mapped to exit 1).
-    //            Fail closed; otherwise classifyCi would see "no required
-    //            → pass" on a PR with failing required CI we couldn't read.
-    //   exit 8 — pending with no rows yet. Cannot tell apart from
-    //            "no required checks." Fail closed; tick retries.
-    if (result.stdout.trim() === "") {
+    // Empty stdout handling, by exit code (mirrors fetchChecks).
+    if (stdoutTrim === "") {
       if (result.exitCode === 1) {
         throw new Error(
           `gh pr checks --required ${branch} exited 1 with empty body: ${result.stderr.trim() || "<no stderr>"}`,
@@ -515,33 +519,9 @@ export class GitHubCliAdapter implements GitHubPort {
       }
       return new Set<string>();
     }
-    // Successful read but unparseable JSON is fail-closed: `gh` is supposed
-    // to emit a JSON array, and a non-array means we cannot reason about
-    // which checks are required.
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(result.stdout);
-    } catch (err) {
-      throw new Error(
-        `gh pr checks --required returned unparseable JSON for ${branch}: ${(err as Error).message}`,
-      );
-    }
-    if (!Array.isArray(parsed)) {
-      throw new Error(
-        `gh pr checks --required returned non-array JSON for ${branch}: ${result.stdout.slice(0, 200)}`,
-      );
-    }
-    const keys = new Set<string>();
-    for (const row of parsed) {
-      const r = (row ?? {}) as Record<string, unknown>;
-      const workflow =
-        r.workflow === null || r.workflow === undefined
-          ? ""
-          : String(r.workflow);
-      const name = String(r.name ?? "");
-      keys.add(requiredKeyOf({ workflow: workflow === "" ? null : workflow, name }));
-    }
-    return keys;
+    throw new Error(
+      `gh pr checks --required returned unparseable / non-array JSON for ${branch}: ${stdoutTrim.slice(0, 200)}`,
+    );
   }
 
   // Protected so tests can subclass and stub a fake `gh` without spinning
@@ -640,6 +620,39 @@ function mapCheckRow(row: unknown): PrCheck {
     bucket,
     required: false,
   };
+}
+
+// Try to parse `s` as a JSON array. Returns the array on success; null
+// when the input is empty, not valid JSON, or valid JSON but not an
+// array. Used by the gh-checks readers to drive the outcome from a
+// trustworthy parsed body whenever one is present, and only fall back to
+// stderr / textual hints when there is no JSON to parse.
+function tryParseJsonArray(s: string): unknown[] | null {
+  if (s === "") return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(s);
+  } catch {
+    return null;
+  }
+  return Array.isArray(parsed) ? parsed : null;
+}
+
+function noChecksPhraseIn(lower: string): boolean {
+  return (
+    lower.includes("no checks") ||
+    lower.includes("no check runs") ||
+    lower.includes("no required checks")
+  );
+}
+
+function noRequiredChecksPhraseIn(lower: string): boolean {
+  return (
+    lower.includes("no required checks") ||
+    lower.includes("no required") ||
+    lower.includes("no check runs") ||
+    lower.includes("no checks")
+  );
 }
 
 function mapBucket(raw: unknown): PrCheckBucket {
