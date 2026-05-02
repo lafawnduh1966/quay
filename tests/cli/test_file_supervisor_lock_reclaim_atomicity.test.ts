@@ -190,3 +190,67 @@ test("reclaim leaves a live-owner mutex in place after the rename-aside check", 
   const owner = JSON.parse(readFileSync(mutexPath, "utf8"));
   expect(owner.pid).toBe(liveOwnerPid);
 });
+
+test("legit-holder takeover-mutex is NEVER moved aside (no empty-canonical window)", () => {
+  // Reviewer's specific scenario: process B legitimately holds the
+  // takeover mutex. Process A's tryReclaimMutex must not even
+  // briefly empty the canonical mutex path — otherwise process C can
+  // `linkSync` into the empty path and end up inside the takeover
+  // critical section concurrently with B.
+  //
+  // We pin this by counting filesystem mutations: a `readdirSync`
+  // sample taken inside the `isAlive` hook (which fires WHILE the
+  // reclaim decision is in progress) must see the canonical mutex
+  // path present at every observation. With the v3 phase-1
+  // pre-check, the legit-holder branch never reaches the rename, so
+  // the canonical path is never empty during the decision.
+  const { readdirSync } = require("node:fs") as typeof import("node:fs");
+  const path = tempLockfile();
+  const stalePid = 999_914;
+  const liveOwnerPid = 5678;
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  const mutexPath = `${path}.takeover-mutex`;
+  writeFileSync(
+    mutexPath,
+    JSON.stringify({ pid: liveOwnerPid, taken_at_ms: Date.now() }),
+  );
+
+  let observedMissing = false;
+  let observedAside = false;
+  const lockA = new FileSupervisorLock({
+    lockfilePath: path,
+    isAlive: (pid) => {
+      // Sample the lockfile dir mid-decision. The hook fires when A's
+      // tryReclaimMutex calls isAlive on the pre-read owner — i.e.
+      // exactly the place where the OLD v2 code would have already
+      // renamed the mutex aside.
+      try {
+        const entries = readdirSync(join(path, ".."));
+        if (!entries.includes("tick.lock.takeover-mutex")) {
+          observedMissing = true;
+        }
+        // Aside files have a `.takeover-mutex.reclaim-` prefix; if any
+        // exist mid-decision, the rename-aside has happened — exactly
+        // what we want to prove DOESN'T happen for a legit holder.
+        if (entries.some((e) => e.startsWith("tick.lock.takeover-mutex.reclaim-"))) {
+          observedAside = true;
+        }
+      } catch {}
+      return pid === liveOwnerPid;
+    },
+  });
+
+  const result = lockA.tryRun(() => {});
+  expect(result.acquired).toBe(false);
+  // The legit holder's mutex was never moved aside, never unlinked.
+  expect(observedMissing).toBe(false);
+  expect(observedAside).toBe(false);
+  // And the canonical mutex still has the live owner's payload.
+  expect(existsSync(mutexPath)).toBe(true);
+  const owner = JSON.parse(readFileSync(mutexPath, "utf8"));
+  expect(owner.pid).toBe(liveOwnerPid);
+});
