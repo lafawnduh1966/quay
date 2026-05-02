@@ -14,7 +14,15 @@
 // (or one that died before tmux noticed) has an old mtime. Without this
 // pipe, every long-running task gets stale-killed past the staleness
 // threshold even when actively producing output.
-import { existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import type { TmuxPort, TmuxSpawnInput } from "../ports/tmux.ts";
 
@@ -147,12 +155,32 @@ export class TmuxAdapter implements TmuxPort {
       }
       // Tail-read: bias toward the most recent output, which is what the
       // classifier and the operator actually want to see for "what was
-      // this worker doing when it died?"
-      const fd = Bun.file(logPath);
-      const slice = fd.slice(stat.size - MAX_LOG_BYTES);
-      return new TextDecoder().decode(
-        new Uint8Array(slice.arrayBuffer() as unknown as ArrayBufferLike),
-      );
+      // this worker doing when it died?". `Bun.file().slice().arrayBuffer()`
+      // returns a Promise, so calling it synchronously decoded as empty —
+      // every >4MiB log was silently lost. Use Node's blocking
+      // `openSync` + positional `readSync` instead.
+      const fd = openSync(logPath, "r");
+      try {
+        const buf = Buffer.alloc(MAX_LOG_BYTES);
+        const offset = stat.size - MAX_LOG_BYTES;
+        let total = 0;
+        while (total < MAX_LOG_BYTES) {
+          const n = readSync(
+            fd,
+            buf,
+            total,
+            MAX_LOG_BYTES - total,
+            offset + total,
+          );
+          if (n === 0) break;
+          total += n;
+        }
+        return buf.subarray(0, total).toString("utf8");
+      } finally {
+        try {
+          closeSync(fd);
+        } catch {}
+      }
     } catch {
       return null;
     }
