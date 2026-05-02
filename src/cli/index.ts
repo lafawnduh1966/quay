@@ -19,7 +19,7 @@ import {
   SlackAdapter,
   TmuxAdapter,
 } from "../adapters/index.ts";
-import { InProcessSupervisorLock } from "../core/supervisor_lock.ts";
+import { FileSupervisorLock } from "../core/supervisor_lock.ts";
 import { SystemClock } from "../ports/clock.ts";
 import { UuidIdGenerator } from "../ports/id_generator.ts";
 import { dispatch, type CliDeps } from "./dispatch.ts";
@@ -54,7 +54,12 @@ async function main(): Promise<number> {
     slack: new SlackAdapter(),
     commandRunner: new ShellCommandRunner(),
     artifactStore,
-    supervisorLock: new InProcessSupervisorLock(),
+    supervisorLock: new FileSupervisorLock({
+      // Spec §11: `tick_lock_path` defaults to `${data_dir}/tick.lock`. Name
+      // retained for compatibility; semantically the supervisor lock that
+      // serializes every tmux/Slack/gh/branch side effect across processes.
+      lockfilePath: join(dataDir, "tick.lock"),
+    }),
     paths: { reposRoot, worktreesRoot, artifactsRoot },
   };
 

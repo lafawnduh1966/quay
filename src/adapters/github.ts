@@ -27,7 +27,7 @@ import type {
   PrTerminalState,
 } from "../ports/github.ts";
 
-interface RunResult {
+export interface RunResult {
   exitCode: number;
   stdout: string;
   stderr: string;
@@ -84,16 +84,33 @@ export class GitHubCliAdapter implements GitHubPort {
   }
 
   prSnapshot(repoId: string, branch: string): PrSnapshot | null {
+    // Spec §5 / §12: tick must reject CI evaluation when the check rows it
+    // sees were produced against a SHA that's no longer the PR head (force
+    // push or GitHub lag). `gh pr checks --json` does not surface a per-row
+    // SHA, so we bracket the checks call with two `gh pr view --json
+    // headRefOid` reads:
+    //
+    //   - `headShaBefore` is the SHA we believe the checks describe — it's
+    //     what was at the head of the PR at the moment we asked `gh` for
+    //     check rows. We propagate it as `checks.checkSha`.
+    //   - `headShaAfter` is the SHA at the moment the snapshot returns —
+    //     we propagate it as `headSha`.
+    //
+    // If a force-push lands between the two reads, the two SHAs disagree;
+    // `classifyCi` returns "stale" and tick logs `tick_error` rather than
+    // transitioning on possibly-old green checks.
     const view = this.fetchPrView(repoId, branch);
     if (view === null) return null;
+    const headShaBefore = view.headSha;
     const checks = this.fetchChecks(repoId, branch);
+    const headShaAfter = this.fetchHeadShaOnly(repoId, branch) ?? headShaBefore;
     return {
       state: view.state,
-      headSha: view.headSha,
+      headSha: headShaAfter,
       baseSha: view.baseSha,
       mergeable: view.mergeable,
       latestReview: view.latestReview,
-      checks,
+      checks: { ...checks, checkSha: headShaBefore },
     };
   }
 
@@ -184,6 +201,43 @@ export class GitHubCliAdapter implements GitHubPort {
       mergeable: mapMergeable(parsed.mergeable),
       latestReview: extractLatestReview(parsed),
     };
+  }
+
+  // Lightweight head-SHA read used by `prSnapshot` to bracket the checks
+  // call. Returns null when no PR exists for the branch; throws on any
+  // other `gh` failure so the caller can surface a `tick_error` (rather
+  // than silently treating an API blip as "no force-push happened").
+  private fetchHeadShaOnly(repoId: string, branch: string): string | null {
+    const result = this.run(repoId, [
+      "gh",
+      "pr",
+      "view",
+      branch,
+      "--json",
+      "headRefOid",
+    ]);
+    if (result.exitCode !== 0) {
+      const lower = result.stderr.toLowerCase();
+      if (
+        lower.includes("no pull request") ||
+        lower.includes("not found")
+      ) {
+        return null;
+      }
+      throw new Error(
+        `gh pr view ${branch} (headRefOid) failed: ${result.stderr.trim()}`,
+      );
+    }
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+    } catch (err) {
+      throw new Error(
+        `gh pr view (headRefOid) returned unparseable JSON for ${branch}: ${(err as Error).message}`,
+      );
+    }
+    const sha = String(parsed.headRefOid ?? "");
+    return sha === "" ? null : sha;
   }
 
   private fetchChecks(repoId: string, branch: string): PrChecksReport {
@@ -279,11 +333,14 @@ export class GitHubCliAdapter implements GitHubPort {
       requiredKeys,
     );
     return {
-      // `gh pr checks` doesn't expose the SHA the runs were against, so we
-      // pass null. The stale-SHA detector in tick uses `headRefOid` from
-      // `gh pr view` plus a separate read; the adapter exposes what `gh`
-      // gives us directly. Future refinement: shell out to `gh api` for the
-      // commit SHA per check run when stale-SHA detection needs it.
+      // `gh pr checks --json` does not surface the per-row commit SHA. The
+      // stale-SHA decision is therefore made one level up in `prSnapshot`,
+      // which brackets this call with two `gh pr view --json headRefOid`
+      // reads and rewrites `checkSha` to the head-before SHA + `headSha` to
+      // the head-after SHA. Direct callers of `fetchChecks` (e.g. the
+      // convenience `prCheckStatus` method) get `null`, which preserves the
+      // previous behavior — `prCheckStatus` does not run the stale-SHA
+      // gate.
       checkSha: null,
       items,
     };
@@ -376,7 +433,11 @@ export class GitHubCliAdapter implements GitHubPort {
     return keys;
   }
 
-  private run(repoId: string, cmd: string[]): RunResult {
+  // Protected so tests can subclass and stub a fake `gh` without spinning
+  // up a real binary. Production callers reach `gh` exclusively through
+  // this method, so a subclass override has full control over command
+  // dispatch.
+  protected run(repoId: string, cmd: string[]): RunResult {
     const cwd = this.bareDir(repoId);
     // Forward `process.env` explicitly. Bun's `spawnSync` snapshots PATH at
     // process startup unless a caller passes `env`, so without this line a

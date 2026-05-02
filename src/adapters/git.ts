@@ -103,14 +103,28 @@ export class LocalGitAdapter implements GitPort {
   }
 
   hasOpenPullRequestForBranch(repoId: string, branch: string): boolean {
-    // The third leg of the spec §12 collision check uses `gh pr list`; the
-    // GitHub adapter is the right home for that, so this method delegates by
-    // shelling out to `gh`. If `gh` is unavailable or unauthenticated, treat
-    // it as "no open PR" — the operator already accepted the JS-side slug
-    // collision rules and the local + remote checks will catch the common
-    // cases. Failing closed here would block enqueues on machines without
-    // `gh` configured for an unrelated reason.
-    const result = run([
+    // Spec §12 collision check, third leg: `gh pr list --head <branch>
+    // --state open` returns non-empty iff the branch already has an open PR
+    // attached. This catches the "remote branch deleted on merge but PR
+    // closed_unmerged" cases — local + remote checks alone would miss it.
+    //
+    // Two correctness invariants:
+    //   1. `gh` must be invoked from inside the bare clone for THIS repo so
+    //      it infers the upstream from `origin`. Without `cwd`, `gh` runs
+    //      against whatever repo the operator's shell happens to be in (or
+    //      none), and the collision check silently inspects the wrong
+    //      project — letting enqueue reuse a branch that has an open PR on
+    //      the actual target repo.
+    //   2. Hard `gh` failures must surface, not get swallowed into "no open
+    //      PR." Failing open here defeats the whole point of the collision
+    //      check: a transient API error or auth misconfig would let enqueue
+    //      reuse an open-PR branch on every retry. The exception is the
+    //      legitimate "no PRs at all" gh response (exit 0 with empty array)
+    //      and the spawn-not-found case (operator has not installed gh —
+    //      caught by the ENOENT branch below; treated as "skip the third
+    //      leg" since the spec's collision check is impossible without gh).
+    const dir = this.bareDir(repoId);
+    const result = runIn(dir, [
       "gh",
       "pr",
       "list",
@@ -121,13 +135,35 @@ export class LocalGitAdapter implements GitPort {
       "--json",
       "number",
     ]);
-    if (result.exitCode !== 0) return false;
-    try {
-      const parsed = JSON.parse(result.stdout);
-      return Array.isArray(parsed) && parsed.length > 0;
-    } catch {
-      return false;
+    if (result.exitCode === 0) {
+      try {
+        const parsed = JSON.parse(result.stdout);
+        return Array.isArray(parsed) && parsed.length > 0;
+      } catch (err) {
+        throw new Error(
+          `gh pr list returned unparseable JSON for ${branch}: ${(err as Error).message}`,
+        );
+      }
     }
+    // `Bun.spawnSync` reports a missing executable either by throwing
+    // ENOENT (caught in `runIn` and forwarded as exitCode -1) or, on some
+    // platforms, by returning exit code 127. Both indicate "gh isn't on
+    // PATH" — operator hasn't wired the GitHub CLI, the spec's third leg
+    // is structurally unavailable, and we degrade gracefully to "no open
+    // PR" so the local + remote legs still gate the enqueue.
+    const stderrLower = result.stderr.toLowerCase();
+    const ghMissing =
+      result.exitCode === -1 ||
+      result.exitCode === 127 ||
+      stderrLower.includes("command not found") ||
+      stderrLower.includes("no such file or directory");
+    if (ghMissing) return false;
+    // Anything else (auth failure, rate limit, network blip, malformed
+    // args, repo-not-recognized) is a hard failure. Fail closed so the
+    // collision check isn't silently skipped.
+    throw new Error(
+      `gh pr list --head ${branch} failed for ${repoId} (exit ${result.exitCode}): ${result.stderr.trim() || result.stdout.trim()}`,
+    );
   }
 
   worktreeAdd(
@@ -321,7 +357,25 @@ export class LocalGitAdapter implements GitPort {
 }
 
 function run(cmd: string[]): RunResult {
-  const result = Bun.spawnSync({ cmd, stdout: "pipe", stderr: "pipe" });
+  // Mirror runIn's spawn-error handling so callers can distinguish
+  // "missing binary" from "binary returned non-zero" by checking for
+  // exitCode === -1. `env: process.env` for the same PATH-snapshot reason
+  // documented on `runIn`.
+  let result;
+  try {
+    result = Bun.spawnSync({
+      cmd,
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (err) {
+    return {
+      exitCode: -1,
+      stdout: "",
+      stderr: (err as Error).message ?? String(err),
+    };
+  }
   return {
     exitCode: result.exitCode ?? 0,
     stdout: decode(result.stdout),
@@ -330,7 +384,31 @@ function run(cmd: string[]): RunResult {
 }
 
 function runIn(cwd: string, cmd: string[]): RunResult {
-  const result = Bun.spawnSync({ cmd, cwd, stdout: "pipe", stderr: "pipe" });
+  // If the executable is missing, `Bun.spawnSync` throws `ENOENT` rather
+  // than returning a non-zero exit. Adapter code that needs to distinguish
+  // "gh not installed" from "gh ran and returned non-zero" relies on
+  // `exitCode === -1`, so map any spawn error into that sentinel.
+  //
+  // `env: process.env` is forwarded explicitly because Bun snapshots PATH
+  // at process startup unless a caller passes `env`. Without it, a test
+  // that prepends a shim directory to `process.env.PATH` would be silently
+  // ignored — the real binary on the original PATH would still resolve.
+  let result;
+  try {
+    result = Bun.spawnSync({
+      cmd,
+      cwd,
+      env: process.env,
+      stdout: "pipe",
+      stderr: "pipe",
+    });
+  } catch (err) {
+    return {
+      exitCode: -1,
+      stdout: "",
+      stderr: (err as Error).message ?? String(err),
+    };
+  }
   return {
     exitCode: result.exitCode ?? 0,
     stdout: decode(result.stdout),

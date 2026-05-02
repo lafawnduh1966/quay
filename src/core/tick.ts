@@ -165,7 +165,12 @@ interface CurrentAttemptRow {
 export function tick_once(deps: TickDeps, options: TickOptions = {}): TickTaskResult[] {
   const max = options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
   const agentInvocation = options.agentInvocation ?? DEFAULT_AGENT_INVOCATION;
-  return deps.supervisorLock.run(() => {
+  // Spec §5: a tick that fires while another tick (or `quay cancel`) holds
+  // the supervisor lock exits immediately without action — the next
+  // scheduled fire retries. `tryRun` returns `acquired: false` in that case;
+  // we surface it as an empty result list rather than throwing, so cron
+  // observes a clean exit.
+  const attempt = deps.supervisorLock.tryRun(() => {
     const results: TickTaskResult[] = [];
 
     // Top-of-loop cancel check (spec §5 + §14). Cancel intent is durable on
@@ -272,6 +277,7 @@ export function tick_once(deps: TickDeps, options: TickOptions = {}): TickTaskRe
 
     return results;
   });
+  return attempt.acquired ? attempt.value : [];
 }
 
 interface CancelTargetRow {
