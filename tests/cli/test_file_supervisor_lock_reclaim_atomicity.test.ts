@@ -276,6 +276,66 @@ test("legit-holder takeover-mutex is NEVER moved or unlinked (no empty-canonical
   expect(owner.pid).toBe(liveOwnerPid);
 });
 
+test("a leaked .reclaim-lock dir fails closed: subsequent reclaim refuses, no path-based stale recovery", () => {
+  // Per the v5 protocol the reclaim-lock has NO stale auto-recovery.
+  // Path-based stale recovery (`stat` + `rmdir`-by-path) would
+  // re-introduce the original race the reclaim-lock was meant to
+  // prevent: two contenders could both observe a stale reclaim-lock,
+  // both rmdir, both mkdir, and both end up inside the supposedly-
+  // serialized critical section.
+  //
+  // The fail-closed behavior means: if `.reclaim-lock` exists for
+  // any reason (a peer is mid-reclaim, OR a previous reclaimer
+  // crashed inside the sub-millisecond critical section and leaked
+  // the dir), we refuse takeover and the operator's manual cleanup
+  // is the recovery path. That is far better than the alternative
+  // of risking double-runs of supervisor side effects.
+  const path = tempLockfile();
+  const stalePid = 999_917;
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  const mutexPath = `${path}.takeover-mutex`;
+  writeFileSync(
+    mutexPath,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  // Pre-seed a leaked reclaim-lock dir, mtime far in the past — under
+  // any age-based recovery scheme this would auto-reclaim. With v5
+  // the leaked dir is sticky regardless of age.
+  const reclaimLockPath = `${mutexPath}.reclaim-lock`;
+  mkdirSync(reclaimLockPath);
+  // Backdating mtime is best-effort: the assertion below holds either
+  // way because v5 doesn't consult mtime at all.
+  try {
+    const { utimesSync } = require("node:fs") as typeof import("node:fs");
+    utimesSync(reclaimLockPath, new Date(Date.now() - 24 * 60 * 60 * 1000), new Date(Date.now() - 24 * 60 * 60 * 1000));
+  } catch {}
+
+  const lock = new FileSupervisorLock({
+    lockfilePath: path,
+    isAlive: () => false,
+  });
+  const result = lock.tryRun(() => {});
+  // No stale auto-recovery: the leaked reclaim-lock blocks takeover
+  // until an operator removes it.
+  expect(result.acquired).toBe(false);
+  // The leaked dir is still there.
+  expect(existsSync(reclaimLockPath)).toBe(true);
+  // The takeover-mutex is left intact (we never entered the critical
+  // section, so we never unlinked it).
+  expect(existsSync(mutexPath)).toBe(true);
+
+  // Manual operator cleanup is then sufficient to recover: rmdir the
+  // reclaim-lock and the next acquire works.
+  const { rmdirSync: rmdirTest } = require("node:fs") as typeof import("node:fs");
+  rmdirTest(reclaimLockPath);
+  const recovered = lock.tryRun(() => {});
+  expect(recovered.acquired).toBe(true);
+});
+
 test("two reclaimers serialize through the reclaim-lock — only one passes through the critical section at a time", () => {
   // Direct simulation of the reviewer's stale-to-fresh race: A enters
   // tryReclaimMutex (reads stale), and during A's decision a second

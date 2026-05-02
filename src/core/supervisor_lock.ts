@@ -31,20 +31,11 @@ import {
   readFileSync,
   renameSync,
   rmdirSync,
-  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
-
-// Stale-window for the reclaim-lock dir used by `tryReclaimMutex`. The
-// reclaim critical section reads the takeover-mutex, decides staleness,
-// and unlinks if dead — a few syscalls. Any reclaim-lock dir whose mtime
-// is older than this window indicates a crashed reclaimer, not a paused
-// one. 30 s is generous: it's longer than any realistic OS pause for a
-// few-syscall sequence on a healthy host.
-const RECLAIM_LOCK_STALE_MS = 30_000;
 
 export interface SupervisorLock {
   // Acquire the lock, blocking the calling thread until acquired (or a stale
@@ -390,7 +381,8 @@ export class FileSupervisorLock implements SupervisorLock {
   // Examine an existing mutex; if its owner is dead beyond the grace
   // window, unlink it. Returns true iff cleanup happened (caller
   // should retry the link); false iff the mutex is still legitimately
-  // held (or contention prevented us from inspecting it).
+  // held, contention prevented us from inspecting it, OR a previous
+  // reclaim crashed mid-section and operator cleanup is required.
   //
   // Concurrency model:
   //
@@ -409,26 +401,33 @@ export class FileSupervisorLock implements SupervisorLock {
   //   into the empty path and become a phantom co-owner alongside the
   //   already-running legitimate holder.
   //
-  //   v4 (this version): serialize reclaim with an outer "reclaim
-  //   lock" directory. Inside the reclaim lock we know no other
-  //   reclaimer is concurrently inspecting or modifying the mutex,
-  //   and acquirers can't replace existing content, so the mutex's
-  //   payload cannot change between our read and our unlink. A
-  //   straightforward `unlinkSync(mutexPath)` is then sound: we either
-  //   unlink the same dead inode we just read, or the holder released
-  //   first and the read returned `null` (in which case we don't
-  //   unlink). The canonical mutex path is *never* emptied while it
-  //   may contain a fresh live owner.
+  //   v4: serialize reclaim with an outer mkdir-based reclaim-lock,
+  //   plus mtime-based stale-recovery for the reclaim-lock itself. The
+  //   stale-recovery added the same `stat` + `rmdirSync(byPath)`
+  //   pattern that the original v1 bug had, just one level removed:
+  //   two contenders could both observe a stale reclaim-lock, both
+  //   rmdir, both mkdir, and both end up inside the supposedly-
+  //   serialized critical section.
   //
-  //   The reclaim lock is a `mkdirSync` directory — atomic and
-  //   portable. A process that crashes mid-reclaim leaves the
-  //   directory orphaned; recovery uses an mtime-based stale window.
-  //   Reclaim is microseconds in the success path, so any age over
-  //   `RECLAIM_LOCK_STALE_MS` indicates a crash. The pause-attack
-  //   theoretical concern (a process suspending for >30 s inside a
-  //   few-syscall critical section, allowing a contender to age-
-  //   reclaim its lock) requires a multi-tens-of-second OS pause that
-  //   is essentially unreachable on a healthy system.
+  //   v5 (this version): NO stale auto-recovery for the reclaim-lock.
+  //   `mkdirSync(EEXIST) → return false`, full stop. If the reclaim-
+  //   lock dir exists for any reason — a peer is reclaiming, OR a
+  //   previous reclaimer crashed mid-section — this tick refuses
+  //   takeover. The crash case requires a process death inside a
+  //   sub-millisecond critical section (mkdir → read → unlink →
+  //   rmdir), so it is vanishingly rare in practice; when it does
+  //   happen, the fix is `rm -rf <data_dir>/tick.lock.takeover-mutex
+  //   <data_dir>/tick.lock.takeover-mutex.reclaim-lock` after
+  //   verifying no live tick / cancel is in flight. That manual
+  //   recovery cost is much cheaper than the alternative of risking
+  //   double-runs of the supervisor's irreversible side effects
+  //   (Slack post, gh promote, tmux spawn, branch update).
+  //
+  //   Inside the reclaim-lock no other reclaimer is concurrently
+  //   modifying the mutex, and acquirers can't replace existing
+  //   content, so the mutex's payload cannot change between our read
+  //   and our unlink. The canonical mutex path is never emptied while
+  //   it may contain a fresh live owner.
   private tryReclaimMutex(mutexPath: string): boolean {
     const reclaimLockPath = `${mutexPath}.reclaim-lock`;
     if (!this.acquireReclaimLock(reclaimLockPath)) return false;
@@ -457,37 +456,23 @@ export class FileSupervisorLock implements SupervisorLock {
 
   // Acquire the outer reclaim-lock around tryReclaimMutex's
   // read+decide+unlink critical section. Returns true if we now hold
-  // it; false if another process holds a fresh reclaim-lock or any
-  // unexpected error occurred. Caller-side fallback: a `false` return
-  // surfaces as "refuse takeover this cycle"; the supervisor lock's
-  // outer poll loop retries. Stale-lock recovery uses `mkdirSync`'s
-  // `mtime` because the dir has no payload — fine here because the
-  // reclaim critical section is bounded by a few syscalls and any age
-  // beyond `RECLAIM_LOCK_STALE_MS` indicates a crash, not a paused
-  // owner.
+  // it; false on EEXIST (a peer is reclaiming, or a prior reclaimer
+  // crashed mid-section and the dir is leaked).
+  //
+  // No stale auto-recovery: the canonical compare-and-delete primitive
+  // POSIX provides for files (renameat2(RENAME_EXCHANGE)) is Linux-
+  // only, and stale-recovery via `stat`+`rmdir`-by-path has the same
+  // wrong-inode race we built this lock to prevent. Failing closed
+  // means a crashed reclaim may need operator cleanup; that is a much
+  // smaller cost than a double-run of supervisor side effects.
   private acquireReclaimLock(reclaimLockPath: string): boolean {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        mkdirSync(reclaimLockPath);
-        return true;
-      } catch (err) {
-        const code = (err as NodeJS.ErrnoException).code;
-        if (code !== "EEXIST") return false;
-      }
-      let stat;
-      try {
-        stat = statSync(reclaimLockPath);
-      } catch {
-        // Vanished between EEXIST and stat — retry mkdir.
-        continue;
-      }
-      if (this.now() - stat.mtimeMs < RECLAIM_LOCK_STALE_MS) return false;
-      try {
-        rmdirSync(reclaimLockPath);
-      } catch {}
-      // Retry mkdir.
+    try {
+      mkdirSync(reclaimLockPath);
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
+      throw err;
     }
-    return false;
   }
 
   private readPayload(): LockfilePayload | null {
