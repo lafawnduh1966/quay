@@ -3,8 +3,10 @@ import type { Clock } from "../../ports/clock.ts";
 import { QuayError } from "../errors.ts";
 import {
   repoAddInputSchema,
+  repoImportInputSchema,
   repoUpdateInputSchema,
   type RepoAddInput,
+  type RepoImportInput,
   type RepoUpdateInput,
 } from "./schema.ts";
 
@@ -31,6 +33,15 @@ export interface RepoService {
   update(repoId: string, patch: unknown): RepoRow;
   remove(repoId: string): RepoRow;
   get(repoId: string): RepoRow | null;
+  // Per spec §10 read commands: full registry, archived rows included so
+  // operators can see what's been soft-deleted. Stable order by repo_id.
+  list(): RepoRow[];
+  // Bulk-restore companion to `add`: spec §10 says `quay repo import` upserts.
+  // Unlike `add` (which errors on duplicate, non-archived), `upsert` always
+  // writes. When the input row carries `archived_at`/`created_at`, those are
+  // preserved (full-fidelity backup restore); when omitted on insert,
+  // `created_at` defaults to `now()` and `archived_at` to NULL.
+  upsert(input: unknown): RepoRow;
 }
 
 const SELECT_REPO_COLUMNS = `
@@ -165,7 +176,72 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
     return get(repoId)!;
   }
 
-  return { add, update, remove, get };
+  function list(): RepoRow[] {
+    return db
+      .query<RepoRow, []>(
+        `SELECT ${SELECT_REPO_COLUMNS} FROM repos ORDER BY repo_id ASC`,
+      )
+      .all();
+  }
+
+  function upsert(rawInput: unknown): RepoRow {
+    const parsed = parseOrThrow(repoImportInputSchema, rawInput, "repo import");
+    const existing = get(parsed.repo_id);
+    // Carry archived_at/created_at through whenever the dump includes them
+    // so a roundtrip export → wipe → import faithfully restores the same
+    // rows. When omitted (hand-written dumps, fresh imports of a single
+    // row), preserve the existing values for an existing row, else default.
+    const archivedAt =
+      parsed.archived_at !== undefined
+        ? parsed.archived_at
+        : (existing?.archived_at ?? null);
+    const createdAt =
+      parsed.created_at !== undefined
+        ? parsed.created_at
+        : (existing?.created_at ?? clock.nowISO());
+    if (existing) {
+      db.query(
+        `UPDATE repos
+           SET repo_url = ?, base_branch = ?, package_manager = ?, install_cmd = ?,
+               test_cmd = ?, ci_workflow_name = ?, contribution_guide_path = ?,
+               archived_at = ?, created_at = ?
+         WHERE repo_id = ?`,
+      ).run(
+        parsed.repo_url,
+        parsed.base_branch,
+        parsed.package_manager,
+        parsed.install_cmd,
+        parsed.test_cmd ?? null,
+        parsed.ci_workflow_name ?? null,
+        parsed.contribution_guide_path ?? null,
+        archivedAt,
+        createdAt,
+        parsed.repo_id,
+      );
+    } else {
+      db.query(
+        `INSERT INTO repos (
+           repo_id, repo_url, base_branch, package_manager, install_cmd,
+           test_cmd, ci_workflow_name, contribution_guide_path,
+           archived_at, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      ).run(
+        parsed.repo_id,
+        parsed.repo_url,
+        parsed.base_branch,
+        parsed.package_manager,
+        parsed.install_cmd,
+        parsed.test_cmd ?? null,
+        parsed.ci_workflow_name ?? null,
+        parsed.contribution_guide_path ?? null,
+        archivedAt,
+        createdAt,
+      );
+    }
+    return get(parsed.repo_id)!;
+  }
+
+  return { add, update, remove, get, list, upsert };
 }
 
 function parseOrThrow<T>(

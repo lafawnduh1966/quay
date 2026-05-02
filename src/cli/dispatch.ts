@@ -10,7 +10,7 @@
 // `--input <json>` escape hatch is also accepted on write commands so tests
 // and tooling can hand a structured payload directly.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import type { ArtifactStore } from "../artifacts/store.ts";
 import type { DB } from "../db/connection.ts";
 import type { Clock } from "../ports/clock.ts";
@@ -300,6 +300,12 @@ function handleRepo(
       io.stdout(`${JSON.stringify(row)}\n`);
       return { exitCode: 0 };
     }
+    case "list":
+      return handleRepoList(service, io);
+    case "export":
+      return handleRepoExport(rest, service, io);
+    case "import":
+      return handleRepoImport(rest, service, io);
     default:
       return writeError(io, "usage_error", `unknown repo subcommand: ${sub}`);
   }
@@ -349,6 +355,88 @@ function handleRepoUpdate(
       );
   const row = service.update(repoId, patch);
   io.stdout(`${JSON.stringify(row)}\n`);
+  return { exitCode: 0 };
+}
+
+function handleRepoList(
+  service: ReturnType<typeof createRepoService>,
+  io: CliIO,
+): DispatchResult {
+  io.stdout(`${JSON.stringify(service.list())}\n`);
+  return { exitCode: 0 };
+}
+
+function handleRepoExport(
+  argv: string[],
+  service: ReturnType<typeof createRepoService>,
+  io: CliIO,
+): DispatchResult {
+  const out = readFlag(argv, "--out");
+  const body = JSON.stringify(service.list());
+  if (out !== null) {
+    try {
+      writeFileSync(out, `${body}\n`, { encoding: "utf8" });
+    } catch (err) {
+      return writeError(
+        io,
+        "io_error",
+        `failed to write export to ${out}: ${(err as Error).message}`,
+      );
+    }
+    // Stdout still gets the operator-friendly summary, mirroring how `task
+    // get` / `repo add` always emit something so a wrapping script can
+    // verify success.
+    io.stdout(`${JSON.stringify({ out, count: service.list().length })}\n`);
+    return { exitCode: 0 };
+  }
+  io.stdout(`${body}\n`);
+  return { exitCode: 0 };
+}
+
+function handleRepoImport(
+  argv: string[],
+  service: ReturnType<typeof createRepoService>,
+  io: CliIO,
+): DispatchResult {
+  const inputPath = readFlag(argv, "--in");
+  if (inputPath === null) {
+    return writeError(io, "usage_error", "repo import requires --in <path>");
+  }
+  const fileRead = tryReadFile(inputPath);
+  if (!fileRead.ok) return writeError(io, "usage_error", fileRead.message);
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(fileRead.value);
+  } catch (err) {
+    return writeError(
+      io,
+      "usage_error",
+      `repo import: ${inputPath} is not valid JSON: ${(err as Error).message}`,
+    );
+  }
+  if (!Array.isArray(parsed)) {
+    return writeError(
+      io,
+      "usage_error",
+      `repo import: ${inputPath} must contain a JSON array of repo rows`,
+    );
+  }
+  // Per spec §10: "Upserts (idempotent for restore use)." Validation per
+  // row happens inside `service.upsert`; on the first failure we surface
+  // the structured error and abort. We deliberately do NOT wrap the loop
+  // in a SQL transaction: the documented use case is a backup-restore
+  // dump produced by `repo export`, so partial success on a malformed
+  // dump still leaves a useful set of recovered rows for the operator
+  // to inspect — the ones that imported are the prefix of the array up
+  // to the failing row.
+  const ids: string[] = [];
+  for (const row of parsed) {
+    const r = service.upsert(row);
+    ids.push(r.repo_id);
+  }
+  io.stdout(
+    `${JSON.stringify({ imported: ids.length, repo_ids: ids })}\n`,
+  );
   return { exitCode: 0 };
 }
 

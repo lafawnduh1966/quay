@@ -45,3 +45,25 @@ export const repoUpdateInputSchema = z
   .strict();
 
 export type RepoUpdateInput = z.infer<typeof repoUpdateInputSchema>;
+
+// `repo import` rows accept the same required fields as `repo add` plus the
+// two metadata columns (`archived_at`, `created_at`) so a full-fidelity
+// export → wipe → import round-trip preserves timestamps. Both metadata
+// fields are optional: hand-written single-row dumps can omit them and rely
+// on the service's default ("preserve existing" / "now()").
+export const repoImportInputSchema = z
+  .object({
+    repo_id: repoIdSchema,
+    repo_url: nonEmptyString,
+    base_branch: nonEmptyString,
+    package_manager: nonEmptyString,
+    install_cmd: nonEmptyString,
+    test_cmd: nonEmptyString.nullable().optional(),
+    ci_workflow_name: nonEmptyString.nullable().optional(),
+    contribution_guide_path: nonEmptyString.nullable().optional(),
+    archived_at: z.string().nullable().optional(),
+    created_at: nonEmptyString.optional(),
+  })
+  .strict();
+
+export type RepoImportInput = z.infer<typeof repoImportInputSchema>;
