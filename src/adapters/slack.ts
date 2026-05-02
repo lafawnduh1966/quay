@@ -20,6 +20,17 @@ interface SlackMessage {
   subtype?: string;
 }
 
+// Default per-call timeout for the synchronous child fetch. Configurable via
+// QUAY_SLACK_TIMEOUT_MS at the deployment level; the adapter forwards it to
+// the child so a stalled Slack connection cannot hold the supervisor lock
+// indefinitely (spec §5: tick must record `tick_error` and continue, not
+// block the next cycle).
+const DEFAULT_SLACK_TIMEOUT_MS = 30_000;
+// How long the parent waits past the child's own timeout before treating the
+// child as wedged and killing it. The child's AbortController is the primary
+// mechanism; this is a backstop if the child's runtime itself hangs.
+const PARENT_TIMEOUT_GRACE_MS = 5_000;
+
 export class SlackAdapter implements SlackPort {
   // The token is resolved lazily on first use so the production CLI can
   // construct this adapter unconditionally — a deployment without any
@@ -28,11 +39,16 @@ export class SlackAdapter implements SlackPort {
   // to Slack.
   private readonly endpoint: string;
   private readonly explicitToken: string | null;
+  private readonly timeoutMs: number;
 
-  constructor(opts?: { token?: string; endpoint?: string }) {
+  constructor(opts?: { token?: string; endpoint?: string; timeoutMs?: number }) {
     this.explicitToken =
       opts?.token !== undefined && opts.token !== "" ? opts.token : null;
     this.endpoint = opts?.endpoint ?? "https://slack.com/api";
+    this.timeoutMs =
+      opts?.timeoutMs !== undefined && opts.timeoutMs > 0
+        ? opts.timeoutMs
+        : resolveTimeoutFromEnv();
   }
 
   private resolveToken(): string {
@@ -148,6 +164,12 @@ export class SlackAdapter implements SlackPort {
     // process and `spawnSync`-wait on it. The token is passed via the
     // child's env, never argv — argv is visible in `ps`/`/proc/<pid>/cmdline`
     // for the child's lifetime.
+    //
+    // The child wraps `fetch` in an AbortController gated on
+    // `QUAY_SLACK_TIMEOUT_MS` so a stalled HTTP connection aborts cleanly
+    // and the child exits non-zero. As a backstop, the parent's
+    // `spawnSync` carries a slightly longer `timeout` so a wedged child
+    // runtime can't hold the supervisor lock past the bounded budget.
     const result = Bun.spawnSync({
       cmd: [
         process.execPath,
@@ -159,9 +181,14 @@ export class SlackAdapter implements SlackPort {
           ? String(init.body)
           : "",
       ],
-      env: { ...process.env, QUAY_SLACK_TOKEN: token },
+      env: {
+        ...process.env,
+        QUAY_SLACK_TOKEN: token,
+        QUAY_SLACK_TIMEOUT_MS: String(this.timeoutMs),
+      },
       stdout: "pipe",
       stderr: "pipe",
+      timeout: this.timeoutMs + PARENT_TIMEOUT_GRACE_MS,
     });
     if (result.exitCode !== 0) {
       throw new Error(
@@ -222,11 +249,21 @@ function decode(buf: Buffer | Uint8Array | undefined): string {
   return new TextDecoder().decode(buf);
 }
 
+function resolveTimeoutFromEnv(): number {
+  const raw = process.env.QUAY_SLACK_TIMEOUT_MS;
+  if (raw === undefined || raw === "") return DEFAULT_SLACK_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed <= 0) return DEFAULT_SLACK_TIMEOUT_MS;
+  return Math.floor(parsed);
+}
+
 // Child-process script: argv = [_, _, url, method, body]; the token comes
 // in via the `QUAY_SLACK_TOKEN` env var so it never appears in `ps` output.
-// Executes a single fetch against `url` with the given method/body and
-// prints the response body to stdout. Errors print to stderr and exit
-// non-zero. Embedded as a string so the parent never needs a separate file.
+// `QUAY_SLACK_TIMEOUT_MS` bounds how long the child waits on `fetch` before
+// aborting and exiting non-zero — the supervisor lock is held for the
+// duration of this call, so an unbounded fetch would block `quay cancel`
+// and the next tick. Errors print to stderr and exit non-zero. Embedded as
+// a string so the parent never needs a separate file.
 function slackFetchScript(): string {
   return `
 const [url, method, body] = process.argv.slice(1);
@@ -235,7 +272,14 @@ if (!token) {
   process.stderr.write("QUAY_SLACK_TOKEN not set in child env");
   process.exit(1);
 }
-const init = { method, headers: { Authorization: "Bearer " + token } };
+const timeoutMs = Number(process.env.QUAY_SLACK_TIMEOUT_MS || "30000");
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), timeoutMs);
+const init = {
+  method,
+  headers: { Authorization: "Bearer " + token },
+  signal: controller.signal,
+};
 if (method !== "GET" && body) {
   init.headers["Content-Type"] = "application/json; charset=utf-8";
   init.body = body;
@@ -246,8 +290,16 @@ fetch(url, init)
     process.stdout.write(text);
   })
   .catch((err) => {
-    process.stderr.write(String(err && err.message ? err.message : err));
+    const isAbort =
+      (err && (err.name === "AbortError" || err.name === "TimeoutError")) ||
+      /aborted|abort/i.test(String(err && err.message ? err.message : err));
+    if (isAbort) {
+      process.stderr.write("Slack request timed out after " + timeoutMs + "ms");
+    } else {
+      process.stderr.write(String(err && err.message ? err.message : err));
+    }
     process.exit(1);
-  });
+  })
+  .finally(() => clearTimeout(timer));
 `;
 }

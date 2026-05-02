@@ -54,7 +54,10 @@ export class GitHubCliAdapter implements GitHubPort {
     // semantics use `prSnapshot` + `classifyCi`.
     const checks = this.fetchChecks(repoId, branch);
     const required = checks.items.filter((c) => c.required);
-    if (required.length === 0) return { state: "pending" };
+    // Spec §5: "no required checks at all → pass" — repos with no required
+    // checks configured don't gate on CI, so an empty required set must
+    // resolve to pass rather than stranding callers in pending.
+    if (required.length === 0) return { state: "pass" };
     const anyFail = required.some(
       (c) => c.bucket === "fail" || c.bucket === "cancelled",
     );

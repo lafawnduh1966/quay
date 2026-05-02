@@ -337,12 +337,12 @@ test("a leaked .reclaim-lock dir fails closed: subsequent reclaim refuses, no pa
 });
 
 test("two reclaimers serialize through the reclaim-lock — only one passes through the critical section at a time", () => {
-  // Direct simulation of the reviewer's stale-to-fresh race: A enters
-  // tryReclaimMutex (reads stale), and during A's decision a second
-  // process B *also* tries to reclaim. Without serialization, B could
-  // also pass the stale check and act on the same dead inode that A
-  // is operating on. With the v4 reclaim-lock, B's mkdirSync fails
-  // EEXIST and B refuses takeover — that's the correct outcome.
+  // Direct simulation of the stale-to-fresh race this test covers: A
+  // enters tryReclaimMutex (reads stale), and during A's decision a
+  // second process B *also* tries to reclaim. Without serialization, B
+  // could also pass the stale check and act on the same dead inode
+  // that A is operating on. With the v4 reclaim-lock, B's mkdirSync
+  // fails EEXIST and B refuses takeover — that's the correct outcome.
   //
   // We drive B's contention from inside A's `isAlive` hook, gated on
   // the reclaim-lock dir's existence so B fires only AFTER A has
@@ -370,7 +370,7 @@ test("two reclaimers serialize through the reclaim-lock — only one passes thro
     isAlive: (pid) => {
       // Trigger B's contention exactly once, and only when A is
       // observably inside the reclaim-lock critical section. This is
-      // the moment the reviewer's race scenario asks about: A has
+      // the precise window the race scenario targets: A has
       // read the stale mutex and is about to act on it.
       if (!bAttempted && existsSync(reclaimLockPath)) {
         bAttempted = true;
@@ -396,12 +396,11 @@ test("two reclaimers serialize through the reclaim-lock — only one passes thro
 });
 
 test("stale-then-fresh race: a freshening between A's read and A's unlink CANNOT happen under the reclaim-lock", () => {
-  // The reviewer's stale-then-fresh race scenario: A reads a stale
-  // mutex, B freshens between A's read and A's unlink, A unlinks B's
-  // fresh mutex. The v4 protocol prevents this because the reclaim-
-  // lock is acquired BEFORE A's read; B's freshening can't happen
-  // until A releases the reclaim-lock (B would be waiting on the
-  // same reclaim-lock).
+  // Stale-then-fresh race scenario: A reads a stale mutex, B freshens
+  // between A's read and A's unlink, A unlinks B's fresh mutex. The
+  // v4 protocol prevents this because the reclaim-lock is acquired
+  // BEFORE A's read; B's freshening can't happen until A releases the
+  // reclaim-lock (B would be waiting on the same reclaim-lock).
   //
   // We test this directly: pre-seed a stale mutex, then run two
   // sequential reclaim attempts and assert that neither one ever

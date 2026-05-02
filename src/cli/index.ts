@@ -22,11 +22,19 @@ import {
 import { FileSupervisorLock } from "../core/supervisor_lock.ts";
 import { SystemClock } from "../ports/clock.ts";
 import { UuidIdGenerator } from "../ports/id_generator.ts";
+import { loadConfig, tickOptionsFromConfig } from "./config.ts";
 import { dispatch, type CliDeps } from "./dispatch.ts";
 
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
-  const dataDir = process.env.QUAY_DATA_DIR ?? join(homedir(), ".quay");
+  const { config } = loadConfig();
+  // Spec §13: `data_dir` defaults to `~/.quay`. The QUAY_DATA_DIR env var
+  // is the operator's runtime override (handy in tests / containers); the
+  // config file's `data_dir` is the deployment-level default. Env wins.
+  const dataDir =
+    process.env.QUAY_DATA_DIR ??
+    config.data_dir ??
+    join(homedir(), ".quay");
   const reposRoot = join(dataDir, "repos");
   const worktreesRoot = join(dataDir, "worktrees");
   const artifactsRoot = join(dataDir, "artifacts");
@@ -54,13 +62,23 @@ async function main(): Promise<number> {
     slack: new SlackAdapter(),
     commandRunner: new ShellCommandRunner(),
     artifactStore,
-    supervisorLock: new FileSupervisorLock({
+    supervisorLock: new FileSupervisorLock(
       // Spec §11: `tick_lock_path` defaults to `${data_dir}/tick.lock`. Name
       // retained for compatibility; semantically the supervisor lock that
       // serializes every tmux/Slack/gh/branch side effect across processes.
-      lockfilePath: join(dataDir, "tick.lock"),
-    }),
+      config.supervisor_lock_stale_seconds !== undefined
+        ? {
+            lockfilePath:
+              config.tick_lock_path ?? join(dataDir, "tick.lock"),
+            staleSeconds: config.supervisor_lock_stale_seconds,
+          }
+        : {
+            lockfilePath:
+              config.tick_lock_path ?? join(dataDir, "tick.lock"),
+          },
+    ),
     paths: { reposRoot, worktreesRoot, artifactsRoot },
+    tickOptions: tickOptionsFromConfig(config),
   };
 
   const io = {
