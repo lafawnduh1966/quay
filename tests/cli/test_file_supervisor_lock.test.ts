@@ -280,11 +280,11 @@ test("FileSupervisorLock takeover never empties the canonical path (no third-acq
   expect(observedMissing).toBe(false);
 });
 
-test("FileSupervisorLock recovers a takeover-mutex left behind by a crashed acquirer", () => {
-  // If a takeover holder dies between mkdir and rmdir, the mutex
-  // directory is stuck. Subsequent acquirers must reclaim after
-  // `staleMutexMs`. We pre-create the mutex with an old mtime via the
-  // staleMutexMs option set to 0 (any existing mutex is stale).
+test("FileSupervisorLock reclaims a takeover-mutex whose owner PID is dead and beyond grace", () => {
+  // Stale-takeover-mutex recovery: a previous takeover acquirer crashed
+  // between writing owner.json and removing the mutex directory. The
+  // owner file's PID is dead and the timestamp is old. A new acquirer
+  // must reclaim.
   const path = tempLockfile();
   const stalePid = 999_991;
   writeFileSync(
@@ -293,15 +293,91 @@ test("FileSupervisorLock recovers a takeover-mutex left behind by a crashed acqu
   );
   const mutexDir = `${path}.takeover-mutex`;
   mkdirSync(mutexDir);
+  const deadMutexHolder = 999_992;
+  writeFileSync(
+    `${mutexDir}/owner.json`,
+    JSON.stringify({ pid: deadMutexHolder, taken_at_ms: Date.now() - 60_000 }),
+  );
 
   const lock = new FileSupervisorLock({
     lockfilePath: path,
-    isAlive: () => false,
-    staleMutexMs: 0,
+    // Anything except deadMutexHolder/stalePid is alive (e.g. process.pid).
+    isAlive: (pid) => pid !== deadMutexHolder && pid !== stalePid,
   });
   const result = lock.tryRun(() => {});
   expect(result.acquired).toBe(true);
-  // Mutex was cleaned up by tryRun's `finally`.
+  expect(existsSync(mutexDir)).toBe(false);
+});
+
+test("FileSupervisorLock refuses to reclaim a takeover-mutex whose owner PID is alive (paused-but-alive)", () => {
+  // Reviewer scenario: takeover holder is paused (long GC, page fault,
+  // SIGSTOP), not crashed. PID is still alive. A purely age-based reclaim
+  // would let another acquirer steal the mutex; the holder would resume
+  // and clobber a fresh post-reclaim lock. PID-liveness reclaim must
+  // refuse to reclaim — even when the timestamp is old — as long as the
+  // owner PID resolves to a live process.
+  const path = tempLockfile();
+  const stalePid = 999_993;
+  writeFileSync(
+    path,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  const mutexDir = `${path}.takeover-mutex`;
+  mkdirSync(mutexDir);
+  const liveMutexHolder = 1234; // alive, per the isAlive hook below
+  writeFileSync(
+    `${mutexDir}/owner.json`,
+    // Old timestamp — would trigger pure age-based reclaim.
+    JSON.stringify({
+      pid: liveMutexHolder,
+      taken_at_ms: Date.now() - 60_000,
+    }),
+  );
+
+  const lock = new FileSupervisorLock({
+    lockfilePath: path,
+    isAlive: (pid) => pid === liveMutexHolder, // stalePid dead, holder alive
+    // Even with the most aggressive grace window, liveness must veto.
+    staleMutexMs: 0,
+  });
+  const result = lock.tryRun(() => {});
+  expect(result.acquired).toBe(false);
+  // Mutex left intact for the paused holder.
+  expect(existsSync(mutexDir)).toBe(true);
+  expect(existsSync(`${mutexDir}/owner.json`)).toBe(true);
+  const owner = JSON.parse(readFileSync(`${mutexDir}/owner.json`, "utf8"));
+  expect(owner.pid).toBe(liveMutexHolder);
+});
+
+test("FileSupervisorLock takeover-mutex stamps owner.json so contending acquirers can identify the holder", () => {
+  // White-box: confirm the takeover path actually writes its owner PID
+  // into the mutex directory. Without this, a purely age-based reclaim
+  // would slip back in. We probe by stalling the mutex holder mid-fn
+  // (using the supervisor lock's own fn() body) and reading owner.json
+  // from the outside while the holder runs.
+  const path = tempLockfile();
+  const stalePid = 999_994;
+  writeFileSync(
+    path,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  const mutexDir = `${path}.takeover-mutex`;
+
+  const lock = new FileSupervisorLock({
+    lockfilePath: path,
+    isAlive: (pid) => pid !== stalePid,
+  });
+  // The mutex is released as soon as the takeover swap completes, so by
+  // the time `fn()` runs the mutex dir is gone. Snapshot the lockfile
+  // payload inside fn() — that's the durable proof the takeover swap
+  // wrote our PID through the mutex-protected path.
+  let observedPid: number = -1;
+  const result = lock.tryRun(() => {
+    observedPid = JSON.parse(readFileSync(path, "utf8")).pid;
+  });
+  expect(result.acquired).toBe(true);
+  expect(observedPid).toBe(process.pid);
+  // The mutex itself should have been cleaned up after the takeover.
   expect(existsSync(mutexDir)).toBe(false);
 });
 

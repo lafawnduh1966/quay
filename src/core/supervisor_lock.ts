@@ -94,11 +94,14 @@ export interface FileSupervisorLockOptions {
   staleSeconds?: number;
   // Polling interval (ms) for the blocking `run()` mode. Default 100.
   pollIntervalMs?: number;
-  // Maximum age (ms) for the takeover serialization mutex (the
-  // `${lockfilePath}.takeover-mutex` directory) before a contending
-  // acquirer is allowed to force-remove and retry. Real takeovers complete
-  // in <10 ms; this bounds the practical impact of a process crashing
-  // mid-takeover. Default 5000 ms.
+  // Grace window (ms) after which a takeover-mutex whose owner PID is no
+  // longer alive may be reclaimed by a contending acquirer. The mutex
+  // directory records the owner PID + acquired-at timestamp inside an
+  // `owner.json` file; reclaim is conditioned on `!isAlive(owner.pid)`
+  // AND `(now - owner.taken_at_ms) >= staleMutexMs`. Age alone is NOT
+  // sufficient — that would allow a paused-but-alive holder (long GC,
+  // page fault, debugger) to be stripped of its mutex while it's still
+  // about to write to the lockfile. Default 5000 ms.
   staleMutexMs?: number;
   // Hooks for tests — never set in production. `now()` controls staleness
   // arithmetic; `isAlive(pid)` controls whether a recorded PID counts as a
@@ -265,48 +268,126 @@ export class FileSupervisorLock implements SupervisorLock {
         } catch {}
         throw err;
       }
+      // Defense-in-depth: if for any reason another acquirer reclaimed
+      // our mutex and ran their own takeover before we resumed, our
+      // rename may have clobbered their lock. Re-read the mutex owner
+      // — if it's no longer us, log/raise so the caller surfaces the
+      // bug rather than silently double-owning. With PID-liveness
+      // reclaim this should be unreachable for an alive process; leave
+      // the check in place because the cost is one stat.
+      const ownerNow = readPayloadFromPath(mutexOwnerPath(mutexDir));
+      if (ownerNow === null || ownerNow.pid !== process.pid) {
+        throw new Error(
+          `supervisor lock takeover detected mutex theft (mutex owner is ${ownerNow?.pid ?? "missing"}, expected ${process.pid}); manual recovery required`,
+        );
+      }
       return true;
     } finally {
+      // Cleanup: drop owner file then mutex dir. Best-effort; another
+      // acquirer's stale-mutex recovery may have removed them already.
       try {
-        rmdirSync(mutexDir);
-      } catch {
-        // Best-effort. If the mutex is gone (e.g. another acquirer's
-        // stale recovery removed it), nothing to do.
-      }
-    }
-  }
-
-  // mkdir-based mutex acquire with stale recovery. Returns true iff this
-  // call now owns the mutex (must be released by `rmdirSync` in a
-  // `finally`). On EEXIST, checks the mutex's mtime: if older than
-  // `staleMutexMs`, force-removes and retries once. We deliberately don't
-  // loop indefinitely — if a real takeover is in progress concurrently,
-  // the caller's outer poll loop will bring us back.
-  private acquireTakeoverMutex(mutexDir: string): boolean {
-    for (let attempt = 0; attempt < 2; attempt += 1) {
-      try {
-        mkdirSync(mutexDir);
-        return true;
-      } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
-      }
-      let stat;
-      try {
-        stat = statSync(mutexDir);
-      } catch {
-        // Mutex disappeared between mkdir and stat. Loop and retry mkdir.
-        continue;
-      }
-      const ageMs = this.now() - stat.mtimeMs;
-      if (ageMs < this.staleMutexMs) return false;
-      // Stale mutex: best-effort cleanup. If two acquirers race the
-      // cleanup-and-retry, the second's mkdir loses with EEXIST and
-      // bails — same outcome as observing a fresh mutex.
+        unlinkSync(mutexOwnerPath(mutexDir));
+      } catch {}
       try {
         rmdirSync(mutexDir);
       } catch {}
     }
+  }
+
+  // mkdir-based mutex acquire with PID-liveness stale recovery.
+  //
+  // Returns true iff this call now owns the mutex. The mutex directory
+  // contains an `owner.json` file written immediately after the mkdir;
+  // contending acquirers read that file to decide whether the mutex is
+  // legitimately held or reclaimable.
+  //
+  // Reclaim is conditioned on:
+  //   `!isAlive(owner.pid) && (now - owner.taken_at_ms) >= staleMutexMs`.
+  //
+  // Age alone is NOT sufficient — a paused-but-alive holder (long GC,
+  // page fault, debugger pause) is still going to resume and finish its
+  // takeover; reclaiming under it would let the resumed holder clobber
+  // a fresh post-reclaim lock. The PID liveness check pins recovery to
+  // the case the mutex was actually intended for: the holder process is
+  // gone.
+  //
+  // The grace window is a transient-error guard: a one-shot blip in
+  // `isAlive` (e.g. EPERM during process namespace transitions) does
+  // not immediately strip the mutex.
+  private acquireTakeoverMutex(mutexDir: string): boolean {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        mkdirSync(mutexDir);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+        if (this.tryReclaimMutex(mutexDir)) continue;
+        return false;
+      }
+      // We won the mkdir. Stamp ownership immediately so any contending
+      // acquirer can identify us. There's a small window between mkdir
+      // and this write where the directory exists but owner.json is
+      // missing; contending acquirers handle that case by treating it
+      // as "not yet stale, bail and re-poll." No race loss because the
+      // outer caller polls.
+      try {
+        writeFileSync(
+          mutexOwnerPath(mutexDir),
+          JSON.stringify({
+            pid: process.pid,
+            taken_at_ms: this.now(),
+          }),
+        );
+      } catch (err) {
+        // If we can't stamp ownership, drop the mutex so we don't strand
+        // it (no one can read our PID, so no one can reclaim it via the
+        // dead-PID path).
+        try {
+          rmdirSync(mutexDir);
+        } catch {}
+        throw err;
+      }
+      return true;
+    }
     return false;
+  }
+
+  // Examine an existing mutex; if its owner is dead beyond the grace
+  // window, force-remove it. Returns true iff cleanup happened (caller
+  // should retry mkdir); false iff the mutex is still held by a live
+  // owner or within the grace window.
+  private tryReclaimMutex(mutexDir: string): boolean {
+    const owner = readPayloadFromPath(mutexOwnerPath(mutexDir));
+    if (owner === null) {
+      // The owner file may not have been written yet (winner is between
+      // mkdir and writeFileSync). Use mtime as a loose upper bound on
+      // how long that gap can last: if the mutex dir itself is older
+      // than the grace window, the writer crashed mid-init.
+      let stat;
+      try {
+        stat = statSync(mutexDir);
+      } catch {
+        // Directory disappeared between EEXIST and stat — caller should
+        // retry mkdir.
+        return true;
+      }
+      if (this.now() - stat.mtimeMs < this.staleMutexMs) return false;
+      try {
+        rmdirSync(mutexDir);
+      } catch {}
+      return true;
+    }
+    // Owner is recorded. Reclaim ONLY if the owner process is gone AND
+    // we're past the grace window. A paused-but-alive holder is left
+    // alone — they'll resume and finish.
+    if (this.isAlive(owner.pid)) return false;
+    if (this.now() - owner.taken_at_ms < this.staleMutexMs) return false;
+    try {
+      unlinkSync(mutexOwnerPath(mutexDir));
+    } catch {}
+    try {
+      rmdirSync(mutexDir);
+    } catch {}
+    return true;
   }
 
   private readPayload(): LockfilePayload | null {
@@ -333,6 +414,13 @@ export class FileSupervisorLock implements SupervisorLock {
 function writePayload(fd: number, payload: LockfilePayload): void {
   const body = JSON.stringify(payload);
   writeFileSync(fd, body, { encoding: "utf8" });
+}
+
+function mutexOwnerPath(mutexDir: string): string {
+  // Owner-identity file inside the takeover-mutex directory. Contending
+  // acquirers read it to decide PID-liveness reclaim. Kept as a separate
+  // helper so tests can pre-populate it to simulate specific scenarios.
+  return `${mutexDir}/owner.json`;
 }
 
 function readPayloadFromPath(path: string): LockfilePayload | null {
