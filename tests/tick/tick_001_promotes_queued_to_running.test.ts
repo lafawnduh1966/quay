@@ -43,8 +43,10 @@ test("test_001_tick_promotes_queued_to_running", () => {
   const expectedSession = `quay-task-quay-task-${taskId}-1`;
   expect(built.tmux.spawnCalls[0]!.sessionName).toBe(expectedSession);
 
-  // git side-effects: fetch then read remote head before promotion.
-  expect(built.git.countCalls("fetch")).toBe(1);
+  // git side-effects: tolerant fetch then read remote head before promotion.
+  // (`fetchBranchIfExists` is the right call because the first attempt's
+  // `quay/<slug>` ref may not exist on origin yet.)
+  expect(built.git.countCalls("fetchBranchIfExists")).toBe(1);
   expect(built.git.countCalls("remoteHeadSha")).toBe(1);
 
   // Task row transitioned, budget consumed exactly once.

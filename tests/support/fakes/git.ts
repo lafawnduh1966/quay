@@ -11,6 +11,7 @@ export interface FakeGitCall {
 export interface FakeGitFailures {
   cloneBare?: (repoId: string) => boolean;
   fetch?: (repoId: string, ref: string) => boolean;
+  fetchBranchIfExists?: (repoId: string, branch: string) => boolean;
   worktreeAdd?: (worktreePath: string) => boolean;
   worktreeDetach?: (worktreePath: string) => boolean;
   branchDelete?: (branch: string) => boolean;
@@ -60,6 +61,19 @@ export class FakeGit implements GitPort {
     this.record("fetch", { repoId, ref });
     if (this.fail.fetch?.(repoId, ref)) {
       throw new Error(`fake: fetch failed for ${repoId} ${ref}`);
+    }
+  }
+
+  fetchBranchIfExists(repoId: string, branch: string): void {
+    // No-op by default: the fake has no real "remote ref exists" state, and
+    // `remoteHeadSha` is independently seeded via `setRemoteHeadSha`. Tests
+    // exercising "fetch genuinely failed (network / auth)" can opt in via
+    // `fail.fetchBranchIfExists`.
+    this.record("fetchBranchIfExists", { repoId, branch });
+    if (this.fail.fetchBranchIfExists?.(repoId, branch)) {
+      throw new Error(
+        `fake: fetchBranchIfExists failed for ${repoId} ${branch}`,
+      );
     }
   }
 

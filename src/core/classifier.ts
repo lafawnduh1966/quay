@@ -97,8 +97,12 @@ export function classifyAndApply(
     return ingestMalformed(deps, task, attempt, blockerPath, probe.bytes);
   }
 
-  // Step 3: fresh remote/PR snapshot for the progress predicate.
-  deps.git.fetch(task.repo_id, task.branch_name);
+  // Step 3: fresh remote/PR snapshot for the progress predicate. Use the
+  // tolerant fetch: a worker that died before pushing (spawn-window crash,
+  // immediate exit) leaves `quay/<slug>` absent on origin, which is exactly
+  // the "no remote progress" evidence the predicate below feeds on. A hard
+  // fetch failure here would mask that as a tick_error instead.
+  deps.git.fetchBranchIfExists(task.repo_id, task.branch_name);
   const remoteShaAtExit = deps.git.remoteHeadSha(task.repo_id, task.branch_name);
   const prExistsAtExit = deps.github.prExistsForBranch(
     task.repo_id,

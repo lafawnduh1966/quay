@@ -70,6 +70,6 @@ test("test_035_capacity_cap_prevents_extra_spawn", () => {
 
   // No git fetch / remote-head read happened for the capped task either —
   // capacity is checked before any external work.
-  expect(built.git.countCalls("fetch")).toBe(2);
+  expect(built.git.countCalls("fetchBranchIfExists")).toBe(2);
   expect(built.git.countCalls("remoteHeadSha")).toBe(2);
 });

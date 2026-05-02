@@ -91,7 +91,7 @@ export function enqueue(deps: EnqueueDeps, rawInput: unknown): EnqueueResult {
   let cloneAttemptedThisCall = false;
   let worktreeCreated = false;
   let branchCreated = false;
-  let resolvedBranch: string | null = null;
+  let fullBranchName: string | null = null;
   const writtenArtifactPaths: string[] = [];
 
   const rollback = () => {
@@ -104,9 +104,9 @@ export function enqueue(deps: EnqueueDeps, rawInput: unknown): EnqueueResult {
         } catch {}
       }
     }
-    if (branchCreated && resolvedBranch !== null) {
+    if (branchCreated && fullBranchName !== null) {
       try {
-        deps.git.branchDelete(repo.repo_id, resolvedBranch);
+        deps.git.branchDelete(repo.repo_id, fullBranchName);
       } catch {}
     }
     // Per §12 enqueue rollback table: only clean up the bare clone if THIS
@@ -140,19 +140,24 @@ export function enqueue(deps: EnqueueDeps, rawInput: unknown): EnqueueResult {
     // Step 2: fetch base branch.
     deps.git.fetch(repo.repo_id, repo.base_branch);
 
-    // Step 3: branch resolution + collision check.
-    resolvedBranch = resolveBranchName(
+    // Step 3: branch resolution + collision check. Returns the bare slug;
+    // the local/remote branch is `quay/<slug>` per spec §13. We carry the
+    // full `quay/<slug>` form everywhere downstream — worktree-add, SQL,
+    // rollback — so tick.ts (fetch / remoteHeadSha / PR check) and the
+    // worker's eventual push all agree on the same ref.
+    const resolvedSlug = resolveBranchName(
       deps.git,
       repo.repo_id,
       input.external_ref ?? null,
       shortId,
     );
+    fullBranchName = `quay/${resolvedSlug}`;
 
     // Step 4: worktree add. This both creates the directory and registers the local branch.
     deps.git.worktreeAdd(
       repo.repo_id,
       worktreePath,
-      resolvedBranch,
+      fullBranchName,
       `origin/${repo.base_branch}`,
     );
     worktreeCreated = true;
@@ -194,7 +199,7 @@ export function enqueue(deps: EnqueueDeps, rawInput: unknown): EnqueueResult {
           taskId,
           repo.repo_id,
           input.external_ref ?? null,
-          `quay/${resolvedBranch}`,
+          fullBranchName,
           tmuxId,
           worktreePath,
           retryBudget,
@@ -251,12 +256,11 @@ export function enqueue(deps: EnqueueDeps, rawInput: unknown): EnqueueResult {
       throw err;
     }
 
-    // The branch_name column carries the full `quay/<slug>` form. The
-    // resolved slug we tracked above is the trailing piece. Return both.
+    // The branch_name column carries the full `quay/<slug>` form.
     return {
       task_id: taskId,
       state: "queued",
-      branch_name: `quay/${resolvedBranch}`,
+      branch_name: fullBranchName,
       tmux_id: tmuxId,
       worktree_path: worktreePath,
       attempt_id: attemptId,

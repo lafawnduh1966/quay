@@ -74,6 +74,29 @@ export class LocalGitAdapter implements GitPort {
     }
   }
 
+  fetchBranchIfExists(repoId: string, branch: string): void {
+    // Tolerant counterpart of `fetch` for refs that may not yet exist on
+    // origin. Git's normal stderr for that case is "couldn't find remote
+    // ref refs/heads/<branch>"; we match the stable substring and treat as
+    // a no-op so the caller's downstream `remoteHeadSha` returns null and
+    // the spawn/classify flow records that as "no remote progress" rather
+    // than blowing up with a tick error. Anything else (network, auth,
+    // malformed args) still throws.
+    const result = runIn(this.bareDir(repoId), [
+      "git",
+      "fetch",
+      "origin",
+      branch,
+    ]);
+    if (result.exitCode === 0) return;
+    if (result.stderr.toLowerCase().includes("couldn't find remote ref")) {
+      return;
+    }
+    throw new Error(
+      `git fetch origin ${branch} failed for ${repoId}: ${result.stderr.trim()}`,
+    );
+  }
+
   hasLocalBranch(repoId: string, branch: string): boolean {
     const result = runIn(this.bareDir(repoId), [
       "git",

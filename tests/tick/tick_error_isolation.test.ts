@@ -51,13 +51,14 @@ test("test_tick_error_isolated_to_task_and_tick_continues", () => {
   );
 
   const built = buildTickDeps(h);
-  built.git.fail.fetch = (_repoId, ref) => ref === `quay/${failingTask}`;
+  built.git.fail.fetchBranchIfExists = (_repoId, branch) =>
+    branch === `quay/${failingTask}`;
 
   const results = tick_once(built.deps);
 
   expect(results.map((r) => r.action)).toEqual(["tick_error", "spawned"]);
   expect(results[0]!.task_id).toBe(failingTask);
-  expect(results[0]!.error).toContain("fetch failed");
+  expect(results[0]!.error).toContain("fetchBranchIfExists failed");
   expect(results[1]).toEqual({ task_id: healthyTask, action: "spawned" });
 
   const rows = h.db
@@ -76,7 +77,7 @@ test("test_tick_error_isolated_to_task_and_tick_continues", () => {
     {
       task_id: failingTask,
       state: "queued",
-      tick_error: expect.stringContaining("fetch failed"),
+      tick_error: expect.stringContaining("fetchBranchIfExists failed"),
     },
     { task_id: healthyTask, state: "running", tick_error: null },
   ]);
@@ -91,7 +92,7 @@ test("test_tick_error_isolated_to_task_and_tick_continues", () => {
     { task_id: healthyTask, event_type: "spawned" },
   ]);
 
-  delete built.git.fail.fetch;
+  delete built.git.fail.fetchBranchIfExists;
 
   const retry = tick_once(built.deps);
 

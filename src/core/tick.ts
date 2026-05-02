@@ -1513,7 +1513,13 @@ function promoteAndSpawn(
   // Refresh the remote branch ref and snapshot spawn-time inputs *before* the
   // promotion transaction. These reads are external; we don't want them inside
   // the SQL transaction that flips state.
-  deps.git.fetch(task.repo_id, task.branch_name);
+  //
+  // For a brand-new task the worker has not pushed `quay/<slug>` yet, so the
+  // remote ref legitimately doesn't exist. `fetchBranchIfExists` tolerates
+  // that case and lets `remoteHeadSha` return null — the spec records
+  // `remote_sha_at_spawn = null` for the first attempt, so a missing remote
+  // is the *expected* state, not a tick error.
+  deps.git.fetchBranchIfExists(task.repo_id, task.branch_name);
   const remoteSha = deps.git.remoteHeadSha(task.repo_id, task.branch_name);
   const prExisted = deps.github.prExistsForBranch(task.repo_id, task.branch_name)
     ? 1
