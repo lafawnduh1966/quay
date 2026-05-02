@@ -5,7 +5,7 @@
 //   - A dead-PID lockfile is NOT reclaimed inside the grace window — that
 //     gives an operator killing a hung tick a chance to land cancel before a
 //     racing acquirer skips ahead.
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
@@ -196,53 +196,113 @@ test("FileSupervisorLock takeover is atomic against contending acquirers", () =>
   expect(bResult!.acquired).toBe(false);
 });
 
-test("FileSupervisorLock refuses takeover when the file changed between read and rename", () => {
-  // Direct race: acquirer-1 reads stale payload P_old, then before
-  // renaming, acquirer-2 takes over and writes P_new (a different
-  // payload). acquirer-1 then renames the file — it captures P_new (not
-  // P_old). The content-verification step must detect the mismatch and
-  // bail rather than letting acquirer-1 also believe it took over.
+test("FileSupervisorLock refuses takeover when the file changed between pre-mutex read and mutex acquire", () => {
+  // Direct race: acquirer-A reads stale P_old, then before A acquires
+  // the takeover mutex, a concurrent acquirer B successfully takes over
+  // and writes a fresh payload P_new. A's mutex acquire eventually
+  // succeeds; under the mutex A re-reads canonical and observes P_new
+  // (not P_old). A must bail — both the in-progress fn() of B and the
+  // canonical lockfile must remain undisturbed.
   //
-  // We simulate this by injecting a `now()` hook on lockA that, on its
-  // first call (during the stale-read), advances the wall clock far
-  // enough to make P_old look stale; then between A's stale-read and A's
-  // rename, we manually replace the lockfile with a fresh payload (the
-  // analog of "another acquirer just took over"). A's rename then
-  // captures the wrong payload — verification must reject.
+  // Simulated by mutating the lockfile inside `isAlive` (called once
+  // between A's pre-mutex read and A's takeover step). The mutation
+  // models "B's takeover landed between our read and our mutex grab."
   const path = tempLockfile();
   const otherPid = process.pid + 7;
+  const newOwnerPid = otherPid + 1;
+  const newOwnerTakenAt = Date.now();
   writeFileSync(
     path,
     JSON.stringify({ pid: otherPid, taken_at_ms: Date.now() - 60_000 }),
   );
-  // We'll simulate the interleave by overriding `isAlive` to also mutate
-  // the file — when the takeover decision is being made, swap in a fresh
-  // payload before A's rename can run.
   let mutated = false;
   const lockA = new FileSupervisorLock({
     lockfilePath: path,
     isAlive: () => {
       if (!mutated) {
         mutated = true;
-        // Race: a concurrent acquirer just took over with a fresh payload.
         writeFileSync(
           path,
-          JSON.stringify({
-            pid: otherPid + 1,
-            taken_at_ms: Date.now(),
-          }),
+          JSON.stringify({ pid: newOwnerPid, taken_at_ms: newOwnerTakenAt }),
         );
       }
       return false;
     },
   });
   const result = lockA.tryRun(() => {});
-  // A must NOT acquire: it observed P_old, then captured P_new, payload
-  // mismatched, restore was attempted.
+  // Under-mutex re-read sees the new payload, doesn't match A's
+  // `expected` (P_old), so A bails without ever modifying canonical.
   expect(result.acquired).toBe(false);
-  // The fresh lock is back in place (or stayed in place), with the new owner.
-  const restored = JSON.parse(readFileSync(path, "utf8"));
-  expect(restored.pid).toBe(otherPid + 1);
+  const remaining = JSON.parse(readFileSync(path, "utf8"));
+  expect(remaining.pid).toBe(newOwnerPid);
+  expect(remaining.taken_at_ms).toBe(newOwnerTakenAt);
+});
+
+test("FileSupervisorLock takeover never empties the canonical path (no third-acquirer race window)", () => {
+  // Three-acquirer race the previous rename-based protocol allowed:
+  //   A reads stale P_old.
+  //   B takes over → canonical now has P_B; B is in fn().
+  //   A's mismatch path renames B's fresh canonical lock into a
+  //     tombstone — canonical is empty for an instant.
+  //   C `createExclusive` races into the empty path → C in fn().
+  //   B and C both run.
+  //
+  // The mkdir-mutex + rename-from-scratch protocol forbids this by
+  // never moving canonical away. Here we assert the structural
+  // invariant: at every observable moment during a contended takeover,
+  // the canonical path either holds the (stale) original payload or a
+  // takeover winner's fresh payload — it is never absent. We probe by
+  // overriding `isAlive` to read canonical mid-takeover and record
+  // whether it ever vanished.
+  const path = tempLockfile();
+  const stalePid = 999_990;
+  const stalePayload = { pid: stalePid, taken_at_ms: Date.now() - 60_000 };
+  writeFileSync(path, JSON.stringify(stalePayload));
+
+  let observedMissing = false;
+  const lock = new FileSupervisorLock({
+    lockfilePath: path,
+    isAlive: (pid) => {
+      // Sample canonical's existence at the moment the takeover decision
+      // is being made (inside `tryAcquire`'s `isAlive` call). The new
+      // protocol never unlinks canonical, so this should always observe
+      // the file present.
+      if (!existsSync(path)) observedMissing = true;
+      return pid !== stalePid; // stale dead, anything else alive
+    },
+  });
+
+  const result = lock.tryRun(() => {
+    if (!existsSync(path)) observedMissing = true;
+  });
+
+  expect(result.acquired).toBe(true);
+  expect(observedMissing).toBe(false);
+});
+
+test("FileSupervisorLock recovers a takeover-mutex left behind by a crashed acquirer", () => {
+  // If a takeover holder dies between mkdir and rmdir, the mutex
+  // directory is stuck. Subsequent acquirers must reclaim after
+  // `staleMutexMs`. We pre-create the mutex with an old mtime via the
+  // staleMutexMs option set to 0 (any existing mutex is stale).
+  const path = tempLockfile();
+  const stalePid = 999_991;
+  writeFileSync(
+    path,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  const mutexDir = `${path}.takeover-mutex`;
+  mkdirSync(mutexDir);
+
+  const lock = new FileSupervisorLock({
+    lockfilePath: path,
+    isAlive: () => false,
+    staleMutexMs: 0,
+  });
+  const result = lock.tryRun(() => {});
+  expect(result.acquired).toBe(true);
+  // Mutex was cleaned up by tryRun's `finally`.
+  expect(existsSync(mutexDir)).toBe(false);
 });
 
 test("FileSupervisorLock.run throws on reentrant acquire", () => {

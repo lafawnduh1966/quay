@@ -31,6 +31,8 @@ import {
   openSync,
   readFileSync,
   renameSync,
+  rmdirSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -92,6 +94,12 @@ export interface FileSupervisorLockOptions {
   staleSeconds?: number;
   // Polling interval (ms) for the blocking `run()` mode. Default 100.
   pollIntervalMs?: number;
+  // Maximum age (ms) for the takeover serialization mutex (the
+  // `${lockfilePath}.takeover-mutex` directory) before a contending
+  // acquirer is allowed to force-remove and retry. Real takeovers complete
+  // in <10 ms; this bounds the practical impact of a process crashing
+  // mid-takeover. Default 5000 ms.
+  staleMutexMs?: number;
   // Hooks for tests — never set in production. `now()` controls staleness
   // arithmetic; `isAlive(pid)` controls whether a recorded PID counts as a
   // live owner; `sleep(ms)` controls how `run()` polls between attempts.
@@ -105,6 +113,7 @@ export class FileSupervisorLock implements SupervisorLock {
   private readonly lockfilePath: string;
   private readonly staleMs: number;
   private readonly pollIntervalMs: number;
+  private readonly staleMutexMs: number;
   private readonly now: () => number;
   private readonly isAlive: (pid: number) => boolean;
   private readonly sleep: (ms: number) => void;
@@ -113,6 +122,7 @@ export class FileSupervisorLock implements SupervisorLock {
     this.lockfilePath = opts.lockfilePath;
     this.staleMs = (opts.staleSeconds ?? 30) * 1000;
     this.pollIntervalMs = opts.pollIntervalMs ?? 100;
+    this.staleMutexMs = opts.staleMutexMs ?? 5_000;
     this.now = opts.now ?? (() => Date.now());
     this.isAlive = opts.isAlive ?? defaultIsAlive;
     this.sleep = opts.sleep ?? defaultBlockingSleep;
@@ -190,58 +200,113 @@ export class FileSupervisorLock implements SupervisorLock {
     return true;
   }
 
-  // Atomic stale-lock takeover.
+  // Stale-lock takeover, race-free against an arbitrary number of
+  // contending acquirers.
   //
-  // The naive `unlink + create` sequence admits double-acquire under
-  // contention: two acquirers each unlink the stale file, each then
-  // `createExclusive` succeeds against the empty path, and both believe
-  // they own the lock.
+  // Earlier protocol attempts moved the canonical lockfile out of the way
+  // (rename to a tombstone) so its content could be inspected. That
+  // admitted a three-acquirer race: A reads stale; B takes over and
+  // starts running with a fresh lock; A then renames B's fresh lock into
+  // a tombstone during mismatch handling, exposing the empty canonical
+  // path; a third acquirer C `createExclusive`s before A restores. B and
+  // C both end up running.
   //
-  // Instead we use `rename(2)` of the stale lockfile to a per-acquirer
-  // tombstone path. POSIX rename is atomic on the source: when N acquirers
-  // concurrently rename the same source path to N different destinations,
-  // exactly one rename succeeds — the others observe `ENOENT` because the
-  // source has already been moved. The rename winner is the unique
-  // takeover.
+  // The robust solution is to never empty the canonical path during
+  // takeover, AND to serialize takeovers so they cannot interleave.
   //
-  // We additionally verify that the file we just claimed (now at the
-  // tombstone) carries the payload we read before deciding to take over.
-  // If it doesn't, a different concurrent takeover slipped between our
-  // read and our rename and created a fresh lock that we then captured.
-  // We attempt to put it back; if that fails (a third acquirer has now
-  // created a lockfile), we leave the tombstone behind and bail. The new
-  // legitimate owner is undisturbed.
+  // Protocol:
+  //
+  //   1. Acquire a mkdir-based mutex (`${lockfilePath}.takeover-mutex`).
+  //      `mkdir(2)` is atomic on POSIX — exactly one of N concurrent
+  //      acquirers wins; the others observe EEXIST. Stale mutex
+  //      directories (process crashed mid-takeover) are reclaimed via an
+  //      mtime age check, bounded by `staleMutexMs`.
+  //
+  //   2. Under the mutex, re-read the canonical lockfile. If its payload
+  //      no longer matches the `expected` stale payload we observed
+  //      before deciding to take over, another takeover slipped in just
+  //      before we got the mutex. Bail — caller re-polls.
+  //
+  //   3. Write the new payload to a scratch file in the same directory
+  //      (so `rename` stays within one filesystem and is therefore
+  //      atomic), then `renameSync(scratch, canonical)`. POSIX rename
+  //      atomically replaces the destination. Because we hold the
+  //      mutex, no other takeover can be doing the same; because the
+  //      canonical path always has a file (we replace, never empty), no
+  //      first-acquire `createExclusive` can succeed against it. The
+  //      replacement is fully serialized.
+  //
+  //   4. Release the mutex.
   private takeover(expected: LockfilePayload): boolean {
-    const tombstone = `${this.lockfilePath}.stale-${process.pid}-${randomBytes(6).toString("hex")}`;
+    const mutexDir = `${this.lockfilePath}.takeover-mutex`;
+    if (!this.acquireTakeoverMutex(mutexDir)) return false;
     try {
-      renameSync(this.lockfilePath, tombstone);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code === "ENOENT") return false;
-      throw err;
-    }
-    const claimed = readPayloadFromPath(tombstone);
-    const matches =
-      claimed !== null &&
-      claimed.pid === expected.pid &&
-      claimed.taken_at_ms === expected.taken_at_ms;
-    if (!matches) {
-      // We captured a fresh lock that was not the stale one we observed.
-      // Try to restore it so the legitimate owner's release sees its file
-      // intact. If the canonical path is now occupied, leave the tombstone
-      // — best-effort cleanup; the new owner is unaffected.
-      try {
-        renameSync(tombstone, this.lockfilePath);
-      } catch {
-        // Best effort.
+      const current = readPayloadFromPath(this.lockfilePath);
+      if (current === null) return false;
+      if (
+        current.pid !== expected.pid ||
+        current.taken_at_ms !== expected.taken_at_ms
+      ) {
+        // Another takeover slipped in between our pre-mutex read and our
+        // mutex acquire. The new payload may or may not be stale; let the
+        // caller re-poll and reassess from scratch.
+        return false;
       }
-      return false;
+      const scratch = `${this.lockfilePath}.takeover-scratch-${process.pid}-${randomBytes(6).toString("hex")}`;
+      writeFileSync(
+        scratch,
+        JSON.stringify({ pid: process.pid, taken_at_ms: this.now() }),
+      );
+      try {
+        renameSync(scratch, this.lockfilePath);
+      } catch (err) {
+        try {
+          unlinkSync(scratch);
+        } catch {}
+        throw err;
+      }
+      return true;
+    } finally {
+      try {
+        rmdirSync(mutexDir);
+      } catch {
+        // Best-effort. If the mutex is gone (e.g. another acquirer's
+        // stale recovery removed it), nothing to do.
+      }
     }
-    // Drop the (verified-stale) tombstone and create our own lock.
-    try {
-      unlinkSync(tombstone);
-    } catch {}
-    return this.createExclusive();
+  }
+
+  // mkdir-based mutex acquire with stale recovery. Returns true iff this
+  // call now owns the mutex (must be released by `rmdirSync` in a
+  // `finally`). On EEXIST, checks the mutex's mtime: if older than
+  // `staleMutexMs`, force-removes and retries once. We deliberately don't
+  // loop indefinitely — if a real takeover is in progress concurrently,
+  // the caller's outer poll loop will bring us back.
+  private acquireTakeoverMutex(mutexDir: string): boolean {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        mkdirSync(mutexDir);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err;
+      }
+      let stat;
+      try {
+        stat = statSync(mutexDir);
+      } catch {
+        // Mutex disappeared between mkdir and stat. Loop and retry mkdir.
+        continue;
+      }
+      const ageMs = this.now() - stat.mtimeMs;
+      if (ageMs < this.staleMutexMs) return false;
+      // Stale mutex: best-effort cleanup. If two acquirers race the
+      // cleanup-and-retry, the second's mkdir loses with EEXIST and
+      // bails — same outcome as observing a fresh mutex.
+      try {
+        rmdirSync(mutexDir);
+      } catch {}
+    }
+    return false;
   }
 
   private readPayload(): LockfilePayload | null {
