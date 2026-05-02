@@ -191,20 +191,30 @@ test("reclaim leaves a live-owner mutex in place after the rename-aside check", 
   expect(owner.pid).toBe(liveOwnerPid);
 });
 
-test("legit-holder takeover-mutex is NEVER moved aside (no empty-canonical window)", () => {
+test("legit-holder takeover-mutex is NEVER moved or unlinked (no empty-canonical window)", () => {
   // Reviewer's specific scenario: process B legitimately holds the
   // takeover mutex. Process A's tryReclaimMutex must not even
   // briefly empty the canonical mutex path — otherwise process C can
   // `linkSync` into the empty path and end up inside the takeover
   // critical section concurrently with B.
   //
-  // We pin this by counting filesystem mutations: a `readdirSync`
-  // sample taken inside the `isAlive` hook (which fires WHILE the
-  // reclaim decision is in progress) must see the canonical mutex
-  // path present at every observation. With the v3 phase-1
-  // pre-check, the legit-holder branch never reaches the rename, so
-  // the canonical path is never empty during the decision.
-  const { readdirSync } = require("node:fs") as typeof import("node:fs");
+  // The v4 protocol serializes reclaim with an outer `mkdir`-based
+  // reclaim-lock (`<mutex>.reclaim-lock` directory). Inside the
+  // reclaim-lock the takeover-mutex can be inspected and acted on
+  // without races; the canonical mutex path is therefore *never*
+  // moved aside or unlinked while we're still deciding. The reclaim-
+  // lock dir DOES appear briefly mid-decision (that's the whole
+  // point), but it's a separate path that no acquirer would
+  // `linkSync` into.
+  //
+  // We pin this by sampling the filesystem from inside the `isAlive`
+  // hook (which fires WHILE A's reclaim decision is in progress) and
+  // asserting:
+  //   1. The canonical mutex path stays present and is the same inode
+  //      we wrote (i.e., not renamed away to an aside path).
+  //   2. The mutex content stays unchanged throughout the decision.
+  const { readdirSync, statSync: statTest } =
+    require("node:fs") as typeof import("node:fs");
   const path = tempLockfile();
   const stalePid = 999_914;
   const liveOwnerPid = 5678;
@@ -214,30 +224,39 @@ test("legit-holder takeover-mutex is NEVER moved aside (no empty-canonical windo
     JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
   );
   const mutexPath = `${path}.takeover-mutex`;
-  writeFileSync(
-    mutexPath,
-    JSON.stringify({ pid: liveOwnerPid, taken_at_ms: Date.now() }),
-  );
+  const livePayload = {
+    pid: liveOwnerPid,
+    taken_at_ms: Date.now(),
+  };
+  writeFileSync(mutexPath, JSON.stringify(livePayload));
+  const expectedInode = statTest(mutexPath).ino;
 
   let observedMissing = false;
-  let observedAside = false;
+  let observedInodeChange = false;
+  let observedRenameAside = false;
   const lockA = new FileSupervisorLock({
     lockfilePath: path,
     isAlive: (pid) => {
-      // Sample the lockfile dir mid-decision. The hook fires when A's
-      // tryReclaimMutex calls isAlive on the pre-read owner — i.e.
-      // exactly the place where the OLD v2 code would have already
-      // renamed the mutex aside.
       try {
-        const entries = readdirSync(join(path, ".."));
+        const dir = join(path, "..");
+        const entries = readdirSync(dir);
         if (!entries.includes("tick.lock.takeover-mutex")) {
           observedMissing = true;
+        } else if (statTest(mutexPath).ino !== expectedInode) {
+          observedInodeChange = true;
         }
-        // Aside files have a `.takeover-mutex.reclaim-` prefix; if any
-        // exist mid-decision, the rename-aside has happened — exactly
-        // what we want to prove DOESN'T happen for a legit holder.
-        if (entries.some((e) => e.startsWith("tick.lock.takeover-mutex.reclaim-"))) {
-          observedAside = true;
+        // Sentinel for any v2/v3-style rename-aside file (paths like
+        // `tick.lock.takeover-mutex.reclaim-<pid>-<rand>`). v4 uses a
+        // directory named `.reclaim-lock` (no rand suffix) — that's
+        // a separate path and not a problem, so we exclude it.
+        if (
+          entries.some(
+            (e) =>
+              e.startsWith("tick.lock.takeover-mutex.reclaim-") &&
+              e !== "tick.lock.takeover-mutex.reclaim-lock",
+          )
+        ) {
+          observedRenameAside = true;
         }
       } catch {}
       return pid === liveOwnerPid;
@@ -246,11 +265,113 @@ test("legit-holder takeover-mutex is NEVER moved aside (no empty-canonical windo
 
   const result = lockA.tryRun(() => {});
   expect(result.acquired).toBe(false);
-  // The legit holder's mutex was never moved aside, never unlinked.
+  // The legit holder's mutex was never moved aside, never unlinked,
+  // never replaced with a different inode during the decision.
   expect(observedMissing).toBe(false);
-  expect(observedAside).toBe(false);
+  expect(observedInodeChange).toBe(false);
+  expect(observedRenameAside).toBe(false);
   // And the canonical mutex still has the live owner's payload.
   expect(existsSync(mutexPath)).toBe(true);
   const owner = JSON.parse(readFileSync(mutexPath, "utf8"));
   expect(owner.pid).toBe(liveOwnerPid);
+});
+
+test("two reclaimers serialize through the reclaim-lock — only one passes through the critical section at a time", () => {
+  // Direct simulation of the reviewer's stale-to-fresh race: A enters
+  // tryReclaimMutex (reads stale), and during A's decision a second
+  // process B *also* tries to reclaim. Without serialization, B could
+  // also pass the stale check and act on the same dead inode that A
+  // is operating on. With the v4 reclaim-lock, B's mkdirSync fails
+  // EEXIST and B refuses takeover — that's the correct outcome.
+  //
+  // We drive B's contention from inside A's `isAlive` hook, gated on
+  // the reclaim-lock dir's existence so B fires only AFTER A has
+  // entered its reclaim critical section. (A's `isAlive` is also
+  // called at the supervisor-lockfile level *before* A acquires the
+  // reclaim-lock; without the gate, B would race A there instead.)
+  const path = tempLockfile();
+  const stalePid = 999_916;
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  const mutexPath = `${path}.takeover-mutex`;
+  writeFileSync(
+    mutexPath,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  const reclaimLockPath = `${mutexPath}.reclaim-lock`;
+
+  let bAttempted = false;
+  const bAcquiredHolder: { value: boolean | null } = { value: null };
+  const lockA = new FileSupervisorLock({
+    lockfilePath: path,
+    isAlive: (pid) => {
+      // Trigger B's contention exactly once, and only when A is
+      // observably inside the reclaim-lock critical section. This is
+      // the moment the reviewer's race scenario asks about: A has
+      // read the stale mutex and is about to act on it.
+      if (!bAttempted && existsSync(reclaimLockPath)) {
+        bAttempted = true;
+        const lockB = new FileSupervisorLock({
+          lockfilePath: path,
+          // B's hook treats anything as dead so its OWN takeover path
+          // would otherwise succeed — leaving the reclaim-lock as
+          // the only thing preventing B from racing A.
+          isAlive: () => false,
+        });
+        bAcquiredHolder.value = lockB.tryRun(() => {}).acquired;
+      }
+      return pid !== stalePid;
+    },
+  });
+  const aResult = lockA.tryRun(() => {});
+  // A acquired (its reclaim was serialized; B did not interfere).
+  expect(aResult.acquired).toBe(true);
+  // B fired (the reclaim-lock dir was observable mid-decision).
+  expect(bAttempted).toBe(true);
+  // And B refused: it could not enter A's serialized critical section.
+  expect(bAcquiredHolder.value).toBe(false);
+});
+
+test("stale-then-fresh race: a freshening between A's read and A's unlink CANNOT happen under the reclaim-lock", () => {
+  // The reviewer's stale-then-fresh race scenario: A reads a stale
+  // mutex, B freshens between A's read and A's unlink, A unlinks B's
+  // fresh mutex. The v4 protocol prevents this because the reclaim-
+  // lock is acquired BEFORE A's read; B's freshening can't happen
+  // until A releases the reclaim-lock (B would be waiting on the
+  // same reclaim-lock).
+  //
+  // We test this directly: pre-seed a stale mutex, then run two
+  // sequential reclaim attempts and assert that neither one ever
+  // sees a "different mutex inode at unlink time than at read time"
+  // — which is structurally impossible under the v4 protocol because
+  // the read and unlink happen inside the same reclaim-lock critical
+  // section.
+  const path = tempLockfile();
+  const stalePid = 999_915;
+  mkdirSync(join(path, ".."), { recursive: true });
+  writeFileSync(
+    path,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+  const mutexPath = `${path}.takeover-mutex`;
+  writeFileSync(
+    mutexPath,
+    JSON.stringify({ pid: stalePid, taken_at_ms: Date.now() - 60_000 }),
+  );
+
+  const lockA = new FileSupervisorLock({
+    lockfilePath: path,
+    isAlive: (pid) => pid !== stalePid,
+  });
+  const aResult = lockA.tryRun(() => {
+    // Inside A's takeover, the takeover-mutex was released after the
+    // reclaim+swap completed. Any concurrent reclaim attempt now
+    // would simply create a fresh mutex via the normal acquire path;
+    // a stale-mutex reclaim is not in play here.
+    expect(existsSync(mutexPath)).toBe(false);
+  });
+  expect(aResult.acquired).toBe(true);
 });

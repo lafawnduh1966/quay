@@ -30,11 +30,21 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
+
+// Stale-window for the reclaim-lock dir used by `tryReclaimMutex`. The
+// reclaim critical section reads the takeover-mutex, decides staleness,
+// and unlinks if dead — a few syscalls. Any reclaim-lock dir whose mtime
+// is older than this window indicates a crashed reclaimer, not a paused
+// one. 30 s is generous: it's longer than any realistic OS pause for a
+// few-syscall sequence on a healthy host.
+const RECLAIM_LOCK_STALE_MS = 30_000;
 
 export interface SupervisorLock {
   // Acquire the lock, blocking the calling thread until acquired (or a stale
@@ -378,122 +388,106 @@ export class FileSupervisorLock implements SupervisorLock {
   }
 
   // Examine an existing mutex; if its owner is dead beyond the grace
-  // window, take ownership of the inode we observed and remove it.
-  // Returns true iff cleanup happened (caller should retry the link);
-  // false iff the mutex is still legitimately held.
+  // window, unlink it. Returns true iff cleanup happened (caller
+  // should retry the link); false iff the mutex is still legitimately
+  // held (or contention prevented us from inspecting it).
   //
-  // History of races driving the current shape:
+  // Concurrency model:
   //
-  //   v1: read payload, decide stale, `unlinkSync(mutexPath)` by path.
-  //   Bug: two reclaimers (A, B) both pass the stale check on the
-  //   same dead mutex; A unlinks and links fresh, B then unlinks A's
-  //   *fresh* mutex by path because B never re-verified the inode at
-  //   unlink time. Result: A and B both inside the takeover critical
-  //   section.
+  //   The mutex content can change in only two ways: (1) the holder
+  //   unlinks it on release, (2) some reclaimer unlinks the stale
+  //   inode and a subsequent caller's `linkSync(scratch, canonical)`
+  //   places fresh content. Acquirers themselves cannot modify
+  //   existing mutex content — `linkSync` fails with EEXIST when the
+  //   path already exists.
   //
-  //   v2: rename canonical to a private aside path first, re-read the
-  //   aside, decide stale only against the moved inode. Fixes the
-  //   "wrong-inode unlink" bug, but introduces a worse one: the rename
-  //   happens unconditionally, so when the mutex is *legitimately
-  //   held* by a live owner B, A's tryReclaimMutex still empties the
-  //   canonical path briefly while inspecting the aside. A third
-  //   process C can `linkSync` into the empty canonical during that
-  //   window and become the new "owner" while B is still inside its
-  //   own critical section.
+  //   So the bug we're protecting against is two reclaimers racing.
+  //   v1 (read+unlink-by-path) let the second reclaimer unlink the
+  //   first reclaimer's fresh mutex. v2/v3 (rename-aside-and-verify)
+  //   solved that but had its own bug: the rename empties the
+  //   canonical path mid-decision, so a third process could `linkSync`
+  //   into the empty path and become a phantom co-owner alongside the
+  //   already-running legitimate holder.
   //
-  //   v3 (this version): a phase-1 pre-check anchors the entire
-  //   protocol to "is the holder actually dead?". If the canonical
-  //   mutex's payload is alive (or within grace), we DO NOT TOUCH the
-  //   file at all — refuse takeover and return false. Only when the
-  //   pre-check shows a dead, beyond-grace owner do we proceed to
-  //   phase 2's rename-aside-and-verify dance, which is necessary to
-  //   guard against the v1-bug case where another reclaimer freshened
-  //   the mutex between our pre-check and our unlink. With phase 1,
-  //   the legit-holder case (the reviewer's flagged scenario) never
-  //   exposes an empty mutex path.
+  //   v4 (this version): serialize reclaim with an outer "reclaim
+  //   lock" directory. Inside the reclaim lock we know no other
+  //   reclaimer is concurrently inspecting or modifying the mutex,
+  //   and acquirers can't replace existing content, so the mutex's
+  //   payload cannot change between our read and our unlink. A
+  //   straightforward `unlinkSync(mutexPath)` is then sound: we either
+  //   unlink the same dead inode we just read, or the holder released
+  //   first and the read returned `null` (in which case we don't
+  //   unlink). The canonical mutex path is *never* emptied while it
+  //   may contain a fresh live owner.
+  //
+  //   The reclaim lock is a `mkdirSync` directory — atomic and
+  //   portable. A process that crashes mid-reclaim leaves the
+  //   directory orphaned; recovery uses an mtime-based stale window.
+  //   Reclaim is microseconds in the success path, so any age over
+  //   `RECLAIM_LOCK_STALE_MS` indicates a crash. The pause-attack
+  //   theoretical concern (a process suspending for >30 s inside a
+  //   few-syscall critical section, allowing a contender to age-
+  //   reclaim its lock) requires a multi-tens-of-second OS pause that
+  //   is essentially unreachable on a healthy system.
   private tryReclaimMutex(mutexPath: string): boolean {
-    // Phase 1: cheap, non-destructive owner check. If the holder is
-    // alive (or within the grace window), refuse takeover without
-    // touching the file. This is the common contention case — two
-    // legitimate processes briefly racing for the takeover mutex —
-    // and avoiding the rename-aside here means we never expose an
-    // empty canonical mutex to third-party acquirers.
-    //
-    // The pre-check has a TOCTOU window vs. phase 2 (the mutex could
-    // be freshened between this read and our rename). Phase 2's
-    // re-read on the moved-aside copy is what catches that.
-    const preRead = readPayloadFromPath(mutexPath);
-    if (preRead === null) {
-      // ENOENT: caller's link retry will succeed. Unparseable: file
-      // exists but content is corrupt — leave it for the operator
-      // since we can't safely decide.
-      return existsSync(mutexPath) ? false : true;
-    }
-    if (this.isAlive(preRead.pid)) return false;
-    if (this.now() - preRead.taken_at_ms < this.staleMutexMs) return false;
-
-    // Phase 2: the canonical mutex looked dead in phase 1. Atomically
-    // take ownership of whatever inode currently lives at the path via
-    // `renameSync` — this is the only POSIX-portable primitive that
-    // moves an inode under our exclusive control regardless of
-    // intervening concurrent activity. Re-verify on the moved-aside
-    // copy: if a freshening race happened between phase 1 and the
-    // rename (another reclaimer re-linked a live mutex), we must NOT
-    // unlink, and we attempt to put the moved-aside content back.
-    //
-    // The narrow residual race here — third party C `linkSync`s into
-    // the canonical path during the put-back window — only fires when
-    // ALL of: (a) phase 1 sees stale, (b) another process freshens
-    // between phase 1 and phase 2's rename, AND (c) C `linkSync`s
-    // during phase 2's tiny rename→link-back interval. With phase 1
-    // the common case (live holder, no contention) is fully safe.
-    const aside = `${mutexPath}.reclaim-${process.pid}-${randomBytes(6).toString("hex")}`;
+    const reclaimLockPath = `${mutexPath}.reclaim-lock`;
+    if (!this.acquireReclaimLock(reclaimLockPath)) return false;
     try {
-      renameSync(mutexPath, aside);
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      // Mutex already gone (another reclaimer moved it aside, or a
-      // release ran). Caller's link retry will land on empty canonical.
-      if (code === "ENOENT") return true;
-      return false;
-    }
-
-    const owner = readPayloadFromPath(aside);
-    if (owner === null) {
-      // Unparseable payload after the move. Drop the aside copy;
-      // canonical is already empty so the caller's retry wins.
+      const owner = readPayloadFromPath(mutexPath);
+      if (owner === null) {
+        // ENOENT: caller's link retry will land on the empty path.
+        // Unparseable payload: leave alone — we cannot safely decide,
+        // operator territory.
+        return existsSync(mutexPath) ? false : true;
+      }
+      if (this.isAlive(owner.pid)) return false;
+      if (this.now() - owner.taken_at_ms < this.staleMutexMs) return false;
+      // Inside the reclaim-lock the mutex content cannot change
+      // between this read and the unlink, so the unlink is sound.
       try {
-        unlinkSync(aside);
+        unlinkSync(mutexPath);
       } catch {}
       return true;
-    }
-    const isLiveOwner =
-      this.isAlive(owner.pid) ||
-      this.now() - owner.taken_at_ms < this.staleMutexMs;
-    if (isLiveOwner) {
-      // Phase-2 re-read disagrees with phase 1 — the mutex was
-      // freshened between our pre-check and our rename. Put it back
-      // via `linkSync` (conditional on canonical still being empty)
-      // so the legitimate freshener's mutex isn't silently dropped.
-      // EEXIST means a third party already linked a different mutex
-      // into the empty canonical; in that case we drop the aside
-      // content (irrecoverable), but the canonical path now reflects
-      // the third party's view.
+    } finally {
       try {
-        linkSync(aside, mutexPath);
+        rmdirSync(reclaimLockPath);
       } catch {}
-      try {
-        unlinkSync(aside);
-      } catch {}
-      return false;
     }
-    // Phase 2 confirms stale. Aside holds the dead inode; canonical is
-    // empty. Drop aside and let the caller's link retry seize the
-    // empty canonical.
-    try {
-      unlinkSync(aside);
-    } catch {}
-    return true;
+  }
+
+  // Acquire the outer reclaim-lock around tryReclaimMutex's
+  // read+decide+unlink critical section. Returns true if we now hold
+  // it; false if another process holds a fresh reclaim-lock or any
+  // unexpected error occurred. Caller-side fallback: a `false` return
+  // surfaces as "refuse takeover this cycle"; the supervisor lock's
+  // outer poll loop retries. Stale-lock recovery uses `mkdirSync`'s
+  // `mtime` because the dir has no payload — fine here because the
+  // reclaim critical section is bounded by a few syscalls and any age
+  // beyond `RECLAIM_LOCK_STALE_MS` indicates a crash, not a paused
+  // owner.
+  private acquireReclaimLock(reclaimLockPath: string): boolean {
+    for (let attempt = 0; attempt < 2; attempt += 1) {
+      try {
+        mkdirSync(reclaimLockPath);
+        return true;
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code;
+        if (code !== "EEXIST") return false;
+      }
+      let stat;
+      try {
+        stat = statSync(reclaimLockPath);
+      } catch {
+        // Vanished between EEXIST and stat — retry mkdir.
+        continue;
+      }
+      if (this.now() - stat.mtimeMs < RECLAIM_LOCK_STALE_MS) return false;
+      try {
+        rmdirSync(reclaimLockPath);
+      } catch {}
+      // Retry mkdir.
+    }
+    return false;
   }
 
   private readPayload(): LockfilePayload | null {
