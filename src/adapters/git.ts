@@ -233,14 +233,24 @@ export class LocalGitAdapter implements GitPort {
     // left as a pile of plain files for the operator.
     //
     // Security: the gitfile is *inside the worker's worktree*, so a worker
-    // can rewrite it to point anywhere on disk. We therefore refuse to
-    // recursively delete an admin path that does not resolve to the
-    // canonical `<reposRoot>/<repo_id>.git/worktrees/<name>` shape — without
-    // this check, a malicious worker could turn `cancel --keep-worktree`
-    // into a primitive that deletes any directory the Quay process can
-    // reach.
+    // can rewrite it to point anywhere on disk. Two layered defenses:
+    //
+    //   1. Shape check: refuse any admin path that doesn't resolve to the
+    //      canonical `<reposRoot>/<repo_id>.git/worktrees/<name>` layout
+    //      (catches escapes outside reposRoot).
+    //   2. Backlink check: even when the path SHAPE is legitimate, the
+    //      admin dir's `gitdir` backlink must canonically resolve to THIS
+    //      worktree's `.git` (catches cross-task aliasing — task A
+    //      rewriting its own `.git` to point at task B's admin dir under
+    //      the same reposRoot would otherwise pass the shape check and
+    //      get task B's admin recursively wiped on the operator's
+    //      `cancel --keep-worktree`).
     if (!existsSync(worktreePath)) return;
     const gitfile = join(worktreePath, ".git");
+    // Canonicalize the gitfile path BEFORE we remove it, so the backlink
+    // check below can compare against a stable identity even if a future
+    // refactor moves the rmSync earlier.
+    const expectedBacklink = canonical(gitfile);
     let adminDirRaw: string | null = null;
     try {
       const contents = readFileSync(gitfile, "utf8");
@@ -249,9 +259,9 @@ export class LocalGitAdapter implements GitPort {
     } catch {
       // No .git pointer — already detached, treat as a no-op.
     }
-    try {
-      rmSync(gitfile, { force: true });
-    } catch {}
+    // Decide what (if anything) to delete BEFORE the gitfile rm so the
+    // two checks operate on a consistent snapshot of on-disk state.
+    let adminToDelete: string | null = null;
     if (adminDirRaw !== null) {
       // Resolve symlinks on both sides before comparison: macOS routes
       // `/var/folders/...` → `/private/var/folders/...`, and git's gitfile
@@ -270,22 +280,31 @@ export class LocalGitAdapter implements GitPort {
         const rel = adminAbs.slice(root.length + 1);
         const segs = rel.split("/");
         const repoSeg = segs[0] ?? "";
-        if (
+        const shapeOk =
           segs.length >= 3 &&
           segs[1] === "worktrees" &&
           segs[2] !== "" &&
           segs[2] !== "." &&
           segs[2] !== ".." &&
           repoSeg.endsWith(".git") &&
-          /^[A-Za-z0-9._-]+\.git$/.test(repoSeg)
-        ) {
-          try {
-            rmSync(adminAbs, { recursive: true, force: true });
-          } catch {}
+          /^[A-Za-z0-9._-]+\.git$/.test(repoSeg);
+        // Backlink check: layered defense against cross-task aliasing.
+        // See the security comment at the top of worktreeDetach.
+        if (shapeOk && adminBacklinksTo(adminAbs, expectedBacklink)) {
+          adminToDelete = adminAbs;
         }
-        // else: outside the canonical layout — leave alone. The next bare-
-        // clone op will lazily prune dangling admin entries.
+        // else: shape mismatch OR backlink mismatch — leave the admin
+        // alone. The next bare-clone op will lazily prune dangling admin
+        // entries.
       }
+    }
+    try {
+      rmSync(gitfile, { force: true });
+    } catch {}
+    if (adminToDelete !== null) {
+      try {
+        rmSync(adminToDelete, { recursive: true, force: true });
+      } catch {}
     }
   }
 
@@ -465,4 +484,22 @@ function canonical(p: string): string {
   } catch {
     return resolve(p);
   }
+}
+
+// Verifies the admin dir's `gitdir` backlink resolves to `expectedBacklink`
+// (the canonical path of THIS worktree's .git). Git stores the backlink as
+// the absolute path to the linked worktree's .git file; if the values
+// don't match (or the file is missing / unreadable), the admin dir does
+// NOT belong to this worktree and must not be deleted. This is the layer
+// that defeats cross-task admin-dir aliasing — see the security comment
+// in worktreeDetach.
+function adminBacklinksTo(adminAbs: string, expectedBacklink: string): boolean {
+  let raw: string;
+  try {
+    raw = readFileSync(join(adminAbs, "gitdir"), "utf8").trim();
+  } catch {
+    return false;
+  }
+  if (raw === "") return false;
+  return canonical(raw) === expectedBacklink;
 }

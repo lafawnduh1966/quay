@@ -97,6 +97,74 @@ t("worktreeDetach preserves the worktree directory and contents", () => {
   adapter.branchDelete("test-repo", "quay/keep-worktree-task");
 });
 
+t("worktreeDetach refuses to delete a sibling task's admin dir under the same reposRoot", () => {
+  // Cross-task attack: even with the canonical-shape filter in place, a
+  // worker in task A can rewrite its own `.git` to point at task B's
+  // legitimate admin dir under the SAME reposRoot. Both
+  // `<reposRoot>/test-repo.git/worktrees/taskA` and
+  // `<reposRoot>/test-repo.git/worktrees/taskB` pass the
+  // `<repo>.git/worktrees/<name>` shape check; without a backlink check,
+  // `cancel taskA --keep-worktree` would recursively delete taskB's
+  // admin dir and corrupt taskB.
+  //
+  // The fix validates that the admin dir's `gitdir` backlink points
+  // back at the worktree being detached. We prove the cross-task wipe
+  // is refused by setting up two real worktrees in one bare clone and
+  // detaching the lying one.
+
+  const reposRoot = tempDir("quay-repos-cross-");
+  const adapter = new LocalGitAdapter(reposRoot);
+
+  const upstream = tempDir("quay-upstream-cross-");
+  shellGit(upstream, "init", "-q", "--initial-branch=main");
+  shellGit(upstream, "config", "user.email", "t@e");
+  shellGit(upstream, "config", "user.name", "t");
+  writeFileSync(join(upstream, "README.md"), "hi\n");
+  shellGit(upstream, "add", "README.md");
+  shellGit(upstream, "commit", "-q", "-m", "init");
+  adapter.cloneBare("test-repo", upstream);
+  adapter.fetch("test-repo", "main");
+
+  const worktreesRoot = tempDir("quay-worktrees-cross-");
+
+  // Victim: task B's worktree, plus its admin dir under the bare clone.
+  const taskBPath = join(worktreesRoot, "task-b");
+  adapter.worktreeAdd("test-repo", taskBPath, "quay/task-b", "origin/main");
+  // The git-managed admin dir for task B. We compute the path via the
+  // bare-clone layout the adapter itself documents — git names it after
+  // the leaf of the worktree path.
+  const taskBAdminDir = join(reposRoot, "test-repo.git", "worktrees", "task-b");
+  expect(existsSync(taskBAdminDir)).toBe(true);
+  // Drop a sentinel inside task B's admin so we can prove it survives.
+  writeFileSync(join(taskBAdminDir, "QUAY_DO_NOT_DELETE"), "preserve");
+
+  // Attacker: task A's worktree.
+  const taskAPath = join(worktreesRoot, "task-a");
+  adapter.worktreeAdd("test-repo", taskAPath, "quay/task-a", "origin/main");
+  // Tamper task A's .git to point at task B's admin dir. Because both
+  // admin paths sit under the same `<reposRoot>/test-repo.git/worktrees/`
+  // tree, the shape filter alone passes — only the backlink check
+  // catches this.
+  writeFileSync(join(taskAPath, ".git"), `gitdir: ${taskBAdminDir}\n`);
+
+  adapter.worktreeDetach(taskAPath);
+
+  // Cross-task containment fired: task B's admin and its sentinel must
+  // still exist. If this assertion fails, cancel of one task can wipe
+  // another task's admin dir — corrupting the other task's worktree
+  // tracking and breaking subsequent git operations against it.
+  expect(existsSync(taskBAdminDir)).toBe(true);
+  expect(existsSync(join(taskBAdminDir, "QUAY_DO_NOT_DELETE"))).toBe(true);
+  // Task B's worktree itself is also untouched.
+  expect(existsSync(taskBPath)).toBe(true);
+  expect(existsSync(join(taskBPath, ".git"))).toBe(true);
+
+  // Sanity: task A's own .git pointer was still removed (the gitfile
+  // delete is the operator-visible part of detach, and it's safe to do
+  // even when the admin-dir delete is refused).
+  expect(existsSync(join(taskAPath, ".git"))).toBe(false);
+});
+
 t("worktreeDetach refuses to follow a tampered .git pointer", () => {
   // Threat model: a worker can write any string into `<worktree>/.git`. If
   // detach blindly trusts the `gitdir:` line and `rmSync(..., recursive)`,
