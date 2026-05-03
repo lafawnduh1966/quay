@@ -267,10 +267,68 @@ export class GitHubCliAdapter implements GitHubPort {
     // The REST endpoint at /pulls/<n>/reviews/<numeric-id>/comments would
     // require translating to the numeric databaseId first; the GraphQL
     // `node(id: $id)` form doesn't, so it's the cleanest path.
+    //
+    // Pagination: GraphQL caps `first` at 100. A review with more inline
+    // comments would silently drop the rest under a single-page query —
+    // and because tick records the review id as acted-on after the
+    // respawn, the missing comments would never be surfaced again. Loop
+    // through pages until `hasNextPage` is false.
+    //
+    // Cap the loop with a generous-but-finite ceiling so a malformed
+    // server response (always-true `hasNextPage`, repeating cursor)
+    // can't wedge tick. 50 pages × 100 = 5000 inline comments is well
+    // above any realistic review; we throw if hit so the operator sees
+    // the anomaly rather than tick silently truncating.
+    const PAGE_SIZE = 100;
+    const MAX_PAGES = 50;
+    const items: InlineReviewComment[] = [];
+    let cursor: string | null = null;
+    for (let page = 0; page < MAX_PAGES; page += 1) {
+      const { nodes, hasNextPage, endCursor } = this.fetchReviewCommentsPage(
+        repoId,
+        reviewNodeId,
+        PAGE_SIZE,
+        cursor,
+      );
+      for (const row of nodes) {
+        const r = (row ?? {}) as Record<string, unknown>;
+        const path = String(r.path ?? "");
+        const line =
+          typeof r.line === "number"
+            ? r.line
+            : typeof r.originalLine === "number"
+              ? r.originalLine
+              : null;
+        const body = String(r.body ?? "");
+        items.push({ path, line, body });
+      }
+      if (!hasNextPage) return items;
+      // Defense: if the server promises a next page but doesn't supply
+      // an advancing cursor, treat as a hard failure rather than looping
+      // on the same page until MAX_PAGES.
+      if (endCursor === null || endCursor === cursor) {
+        throw new Error(
+          `gh api graphql (review comments) reported hasNextPage=true with no advancing cursor for review ${reviewNodeId}`,
+        );
+      }
+      cursor = endCursor;
+    }
+    throw new Error(
+      `gh api graphql (review comments) exceeded ${MAX_PAGES * PAGE_SIZE} inline comments for review ${reviewNodeId}; refusing to truncate silently`,
+    );
+  }
+
+  private fetchReviewCommentsPage(
+    repoId: string,
+    reviewNodeId: string,
+    pageSize: number,
+    cursor: string | null,
+  ): { nodes: unknown[]; hasNextPage: boolean; endCursor: string | null } {
     const query =
-      "query($id: ID!) { node(id: $id) { ... on PullRequestReview { " +
-      "comments(first: 100) { nodes { path line originalLine body } } } } }";
-    const result = this.run(repoId, [
+      "query($id: ID!, $first: Int!, $after: String) { node(id: $id) { ... on PullRequestReview { " +
+      "comments(first: $first, after: $after) { nodes { path line originalLine body } " +
+      "pageInfo { hasNextPage endCursor } } } } }";
+    const args = [
       "gh",
       "api",
       "graphql",
@@ -278,7 +336,13 @@ export class GitHubCliAdapter implements GitHubPort {
       `query=${query}`,
       "-F",
       `id=${reviewNodeId}`,
-    ]);
+      "-F",
+      `first=${pageSize}`,
+    ];
+    if (cursor !== null) {
+      args.push("-f", `after=${cursor}`);
+    }
+    const result = this.run(repoId, args);
     if (result.exitCode !== 0) {
       throw new Error(
         `gh api graphql (review comments) failed for review ${reviewNodeId}: ${result.stderr.trim() || result.stdout.trim()}`,
@@ -310,20 +374,13 @@ export class GitHubCliAdapter implements GitHubPort {
     const node = (data.node ?? {}) as Record<string, unknown>;
     const commentsField = (node.comments ?? {}) as Record<string, unknown>;
     const nodes = Array.isArray(commentsField.nodes) ? commentsField.nodes : [];
-    const items: InlineReviewComment[] = [];
-    for (const row of nodes) {
-      const r = (row ?? {}) as Record<string, unknown>;
-      const path = String(r.path ?? "");
-      const line =
-        typeof r.line === "number"
-          ? r.line
-          : typeof r.originalLine === "number"
-            ? r.originalLine
-            : null;
-      const body = String(r.body ?? "");
-      items.push({ path, line, body });
-    }
-    return items;
+    const pageInfo = (commentsField.pageInfo ?? {}) as Record<string, unknown>;
+    const hasNextPage = pageInfo.hasNextPage === true;
+    const endCursor =
+      typeof pageInfo.endCursor === "string" && pageInfo.endCursor.length > 0
+        ? pageInfo.endCursor
+        : null;
+    return { nodes, hasNextPage, endCursor };
   }
 
   // Lightweight head-SHA read used by `prSnapshot` to bracket the checks
