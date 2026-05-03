@@ -89,7 +89,11 @@ async function main(): Promise<number> {
   };
 
   const io = {
-    stdout: (c: string) => process.stdout.write(c),
+    // process.stdout.write accepts both string and Uint8Array natively,
+    // so we forward whatever dispatch hands us (the `artifact get` path
+    // emits raw bytes to preserve binary / invalid-UTF-8 payloads — see
+    // CliIO docs).
+    stdout: (c: string | Uint8Array) => process.stdout.write(c),
     stderr: (c: string) => process.stderr.write(c),
   };
   const result = await dispatch(argv, deps, io);

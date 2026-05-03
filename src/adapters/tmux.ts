@@ -20,6 +20,8 @@ import {
   openSync,
   readFileSync,
   readSync,
+  readdirSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -28,6 +30,10 @@ import type { TmuxPort, TmuxSpawnInput } from "../ports/tmux.ts";
 
 const PROMPT_FILE = ".quay-prompt.md";
 const SESSION_LOG_FILE = ".quay-session.log";
+// Marker for direct children of the worktree root that belong to a previous
+// Quay attempt. Anything matching this prefix is sweep-eligible at spawn
+// time — see the spawn preflight for why.
+const QUAY_STATE_PREFIX = ".quay-";
 // Cap log artifact reads at a few MB so a runaway agent that never exits
 // doesn't push gigabytes through the artifact store. The tail bias matches
 // "what is the worker doing right now?" — the most recent output is what
@@ -36,6 +42,16 @@ const MAX_LOG_BYTES = 4 * 1024 * 1024;
 
 export class TmuxAdapter implements TmuxPort {
   spawn(input: TmuxSpawnInput): void {
+    // Spawn preflight: sweep direct children of the worktree whose names
+    // start with `.quay-`. A leftover `.quay-blocked.md` from a previous
+    // attempt would otherwise be ingested as the new attempt's blocker on
+    // the next classifier read; a leftover `.quay-session.log` would mix
+    // old bytes into the new attempt's log (and skew the freshness mtime
+    // check, since we open the pipe-pane sink with `cat >>`). Scope is
+    // tight — only direct children, only the `.quay-` prefix — so we never
+    // touch anything the worker wrote under nested directories.
+    sweepQuayState(input.worktreePath);
+
     const promptFile = join(input.worktreePath, PROMPT_FILE);
     writeFileSync(promptFile, input.promptContent);
 
@@ -214,4 +230,30 @@ export class TmuxAdapter implements TmuxPort {
 // escaped with `'\''`, and reopened.
 function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+// Remove every direct child of `worktreePath` whose name starts with the
+// `.quay-` prefix. Best-effort: if the worktree itself is missing or a
+// single entry can't be removed (race with manual cleanup, exotic perms),
+// we skip and let the rest of spawn proceed. Sweeping is a freshness
+// preservative, not a correctness barrier — a missed sweep degrades to
+// "stale state may be re-read", which is exactly the bug we already had.
+function sweepQuayState(worktreePath: string): void {
+  let entries: string[];
+  try {
+    entries = readdirSync(worktreePath);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (!name.startsWith(QUAY_STATE_PREFIX)) continue;
+    try {
+      // recursive+force in case a future feature drops a `.quay-*` directory.
+      // For today's flat files, `force: true` makes us idempotent against
+      // entries that were swept by a concurrent process.
+      rmSync(join(worktreePath, name), { recursive: true, force: true });
+    } catch {
+      // Continue sweeping siblings; see the function-level comment.
+    }
+  }
 }

@@ -457,6 +457,23 @@ function handleCancel(
   if (!taskId) {
     return writeError(io, "usage_error", "cancel requires <task_id>");
   }
+  // Cancel is destructive (kills the tmux session, removes the worktree,
+  // optionally closes the PR). A misspelled flag must NOT be silently
+  // ignored — `cancel --keep-worktre` would otherwise behave like a
+  // worktree-removing cancel because `--keep-worktree` evaluates false,
+  // costing the operator the on-disk state they wanted to preserve. Reject
+  // any unknown long flag before invoking the finalizer.
+  const allowedCancelFlags = new Set(["--close-pr", "--keep-worktree"]);
+  const unknown = argv.find(
+    (a) =>
+      a.startsWith("--") &&
+      !allowedCancelFlags.has(a.includes("=") ? a.slice(0, a.indexOf("=")) : a),
+  );
+  if (unknown !== undefined) {
+    return writeError(io, "usage_error", `unknown cancel flag: ${unknown}`, {
+      flag: unknown,
+    });
+  }
   const closePr = argv.includes("--close-pr");
   const keepWorktree = argv.includes("--keep-worktree");
   const cancelDeps: CancelDeps = {
@@ -661,7 +678,13 @@ function handleArtifact(
     io.stdout(`${row.file_path}\n`);
     return { exitCode: 0 };
   }
-  io.stdout(readFileSync(row.file_path, "utf8"));
+  // Stream raw bytes — no UTF-8 round-trip. `malformed_signal` artifacts
+  // intentionally preserve invalid UTF-8 sequences (that's literally what
+  // the kind documents), so decoding here would corrupt the payload before
+  // it reaches the operator. CliIO.stdout accepts Uint8Array for exactly
+  // this path; the production sink is `process.stdout.write`, which also
+  // accepts bytes natively.
+  io.stdout(readFileSync(row.file_path));
   return { exitCode: 0 };
 }
 
