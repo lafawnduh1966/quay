@@ -232,12 +232,24 @@ function shellQuote(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+// Files whose stale presence directly drives the bug the sweep exists to
+// fix: `.quay-blocked.md` would be ingested as the new attempt's blocker;
+// `.quay-session.log` would mix old bytes into the new attempt's log and
+// skew the mtime-based freshness signal. Failing to remove either of
+// these is treated as a hard spawn failure so the spawn-substrate-failed
+// path takes over (same semantics as a `pipe-pane` failure) — silently
+// proceeding would reintroduce the exact bug this sweep prevents.
+const SWEEP_FAIL_CLOSED = new Set([".quay-blocked.md", ".quay-session.log"]);
+
 // Remove every direct child of `worktreePath` whose name starts with the
-// `.quay-` prefix. Best-effort: if the worktree itself is missing or a
-// single entry can't be removed (race with manual cleanup, exotic perms),
-// we skip and let the rest of spawn proceed. Sweeping is a freshness
-// preservative, not a correctness barrier — a missed sweep degrades to
-// "stale state may be re-read", which is exactly the bug we already had.
+// `.quay-` prefix. The two files in `SWEEP_FAIL_CLOSED` are required
+// removals (see comment above); other `.quay-*` entries are best-effort
+// — a leftover forensic dump or future marker shouldn't refuse to spawn,
+// since proceeding does not reintroduce the original bug for those.
+//
+// `readdirSync` failure (worktree missing / unreadable) returns early:
+// the subsequent `writeFileSync(promptFile, ...)` will fail with the
+// same root cause and produce a clearer error than this preflight could.
 function sweepQuayState(worktreePath: string): void {
   let entries: string[];
   try {
@@ -247,13 +259,21 @@ function sweepQuayState(worktreePath: string): void {
   }
   for (const name of entries) {
     if (!name.startsWith(QUAY_STATE_PREFIX)) continue;
+    const path = join(worktreePath, name);
     try {
-      // recursive+force in case a future feature drops a `.quay-*` directory.
-      // For today's flat files, `force: true` makes us idempotent against
-      // entries that were swept by a concurrent process.
-      rmSync(join(worktreePath, name), { recursive: true, force: true });
-    } catch {
-      // Continue sweeping siblings; see the function-level comment.
+      // recursive+force in case a future feature drops a `.quay-*`
+      // directory. For today's flat files, `force: true` makes us
+      // idempotent against entries that were swept by a concurrent
+      // process — those produce no error and are not mistaken for the
+      // unremovable case below.
+      rmSync(path, { recursive: true, force: true });
+    } catch (err) {
+      if (SWEEP_FAIL_CLOSED.has(name)) {
+        throw new Error(
+          `tmux spawn aborted: failed to sweep stale ${name} from ${worktreePath}: ${(err as Error).message}`,
+        );
+      }
+      // Non-critical leak — continue sweeping siblings.
     }
   }
 }

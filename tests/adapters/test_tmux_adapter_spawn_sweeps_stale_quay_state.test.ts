@@ -19,7 +19,14 @@
 // pipe-pane. We verify (a) stale blocker is gone, (b) old session-log
 // bytes are not present in the new attempt's log, (c) the freshly
 // written prompt is what we asked for.
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
@@ -163,6 +170,81 @@ t("spawn rewrites .quay-prompt.md with the new prompt even if a stale one exists
   // immediately after — so the on-disk content is the fresh body, never
   // a hybrid.
   expect(readFileSync(promptPath, "utf8")).toBe("FRESH PROMPT BODY");
+});
+
+// Fail-closed regression: if `.quay-session.log` (or `.quay-blocked.md`)
+// exists from a prior attempt and the sweep cannot remove it, spawn must
+// abort instead of silently proceeding — proceeding would reintroduce the
+// exact stale-state bug the sweep exists to fix (old log bytes bleeding
+// into the new attempt's log, skewed mtime freshness, etc.). Other
+// `.quay-*` files remain best-effort; only these two are gated.
+//
+// This test does NOT require tmux: the abort happens during the spawn
+// preflight, before tmux is ever invoked.
+test("spawn aborts when a stale .quay-session.log cannot be swept", () => {
+  // chmod-based unremovability does not apply when running as root
+  // (root bypasses the parent-dir write-permission check). CI sometimes
+  // runs as root; skip there to avoid a false negative.
+  if (typeof process.geteuid === "function" && process.geteuid() === 0) {
+    return;
+  }
+  const adapter = new TmuxAdapter();
+  const worktreePath = tempWorktree();
+  const stalePath = join(worktreePath, ".quay-session.log");
+  writeFileSync(stalePath, "stale bytes from previous attempt");
+
+  // Strip write permission on the parent so unlinking the entry fails
+  // with EACCES. Restore in cleanup BEFORE the temp-dir rmSync runs so
+  // afterEach can clean up; cleanups run LIFO and `tempWorktree` already
+  // pushed the rm — we unshift here so this perm-restore fires first.
+  chmodSync(worktreePath, 0o555);
+  cleanups.unshift(() => {
+    try {
+      chmodSync(worktreePath, 0o755);
+    } catch {}
+  });
+
+  expect(() =>
+    adapter.spawn({
+      sessionName: `quay-test-sweep-fail-${Math.random().toString(36).slice(2, 10)}`,
+      worktreePath,
+      promptContent: "ignored",
+      agentInvocation: "true",
+    }),
+  ).toThrow(/quay-session\.log/);
+
+  // The stale file is still on disk (the rm failed) — proves we aborted
+  // BEFORE clobbering anything else and BEFORE spawning tmux. If spawn
+  // had silently proceeded past the failed rm, this file might still be
+  // there too, but pipe-pane would have been wired against it; the
+  // operator-visible failure mode of "fail closed" is the throw, which
+  // we asserted above.
+  expect(existsSync(stalePath)).toBe(true);
+});
+
+test("spawn aborts when a stale .quay-blocked.md cannot be swept", () => {
+  if (typeof process.geteuid === "function" && process.geteuid() === 0) {
+    return;
+  }
+  const adapter = new TmuxAdapter();
+  const worktreePath = tempWorktree();
+  const stalePath = join(worktreePath, ".quay-blocked.md");
+  writeFileSync(stalePath, "STALE BLOCKER");
+  chmodSync(worktreePath, 0o555);
+  cleanups.unshift(() => {
+    try {
+      chmodSync(worktreePath, 0o755);
+    } catch {}
+  });
+
+  expect(() =>
+    adapter.spawn({
+      sessionName: `quay-test-sweep-fail-blocker-${Math.random().toString(36).slice(2, 10)}`,
+      worktreePath,
+      promptContent: "ignored",
+      agentInvocation: "true",
+    }),
+  ).toThrow(/quay-blocked\.md/);
 });
 
 t("spawn does not touch unrelated files in the worktree root", () => {
