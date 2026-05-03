@@ -62,6 +62,11 @@ export interface CliDeps {
   supervisorLock: SupervisorLock;
   paths: CliPaths;
   tickOptions?: TickOptions;
+  // Spec §13: `retry_budget` is a deployment-level knob (default 5). When
+  // the operator overrides it in `~/.quay/config.toml`, the production CLI
+  // forwards it here so enqueue copies the configured value into
+  // `tasks.retry_budget` instead of the EnqueueDeps default.
+  retryBudget?: number;
 }
 
 export interface DispatchResult {
@@ -271,6 +276,9 @@ function handleEnqueue(
     artifactStore: deps.artifactStore,
     paths: deps.paths,
   };
+  if (deps.retryBudget !== undefined) {
+    enqueueDeps.retryBudget = deps.retryBudget;
+  }
   const result = enqueue(enqueueDeps, input);
   io.stdout(`${JSON.stringify(result)}\n`);
   return { exitCode: 0 };

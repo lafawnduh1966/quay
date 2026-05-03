@@ -47,9 +47,11 @@ test("loads a well-formed config.toml from QUAY_CONFIG_FILE override", () => {
     path,
     `agent_invocation = "claude --custom < {prompt_file}"
 max_concurrent = 4
+retry_budget = 8
 staleness_threshold_seconds = 900
 supervisor_lock_stale_seconds = 60
 tick_lock_path = "/tmp/custom-tick.lock"
+worktree_root = "/var/lib/quay/worktrees"
 max_attempt_duration_seconds = 7200
 max_spawn_failures = 5
 claim_timeout_seconds = 600
@@ -63,9 +65,29 @@ max_non_budget_respawns = 30
     "claude --custom < {prompt_file}",
   );
   expect(result.config.max_concurrent).toBe(4);
+  expect(result.config.retry_budget).toBe(8);
   expect(result.config.staleness_threshold_seconds).toBe(900);
   expect(result.config.supervisor_lock_stale_seconds).toBe(60);
   expect(result.config.tick_lock_path).toBe("/tmp/custom-tick.lock");
+  expect(result.config.worktree_root).toBe("/var/lib/quay/worktrees");
+});
+
+test("rejects a non-positive integer for retry_budget", () => {
+  const dir = tempDir();
+  const path = join(dir, "config.toml");
+  writeFileSync(path, `retry_budget = 0\n`);
+  expect(() => loadConfig({ env: { QUAY_CONFIG_FILE: path } })).toThrow(
+    /retry_budget/,
+  );
+});
+
+test("rejects an empty string for worktree_root", () => {
+  const dir = tempDir();
+  const path = join(dir, "config.toml");
+  writeFileSync(path, `worktree_root = ""\n`);
+  expect(() => loadConfig({ env: { QUAY_CONFIG_FILE: path } })).toThrow(
+    /worktree_root/,
+  );
 });
 
 test("QUAY_CONFIG_DIR resolves to <dir>/config.toml", () => {

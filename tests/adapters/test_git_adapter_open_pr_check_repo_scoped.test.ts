@@ -134,6 +134,27 @@ test("hasOpenPullRequestForBranch throws on hard gh failures (no silent skip)", 
   expect((caught as Error).message).toMatch(/scoped-repo/);
 });
 
+test("hasOpenPullRequestForBranch throws when gh exits 0 with non-array JSON (e.g. {})", () => {
+  // `gh pr list --json number` is contractually an array. If a future
+  // gh version (or a misconfigured shim, or a server-side error message
+  // returned with exit 0) emits an object, coercing it to `[]` would let
+  // the spec §12 collision check silently pass on every retry — exactly
+  // the regression we already guard against for hard-error gh failures.
+  // Fail closed on the schema anomaly the same way.
+  const shim = setupGhShim({ exitCode: 0, stdout: "{}\n" });
+  const adapter = new LocalGitAdapter(shim.reposRoot);
+
+  let caught: unknown = null;
+  try {
+    adapter.hasOpenPullRequestForBranch("scoped-repo", "quay/feat");
+  } catch (err) {
+    caught = err;
+  }
+  expect(caught).toBeInstanceOf(Error);
+  expect((caught as Error).message).toMatch(/non-array JSON/);
+  expect((caught as Error).message).toMatch(/scoped-repo/);
+});
+
 test("hasOpenPullRequestForBranch degrades to false when gh is not installed", () => {
   // Force PATH to a directory that contains no `gh` shim. Bun.spawnSync
   // throws ENOENT on missing binaries; the adapter normalizes that into

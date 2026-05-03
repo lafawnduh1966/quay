@@ -72,6 +72,31 @@ supervisor_lock_stale_seconds = 45
   expect(stdout.trim()).toBe("[]");
 });
 
+test("CLI accepts worktree_root and retry_budget overrides from the config file", () => {
+  // Spec §13 keys that didn't have an entry-level smoke test before: the
+  // production CLI must accept both `worktree_root` (deploy-controlled
+  // worktree placement) and `retry_budget` (per-task budget cap) without
+  // tripping the strict schema. We don't run a write command here because
+  // that requires real adapters; just prove startup doesn't reject the
+  // file.
+  const dataDir = tempDir();
+  const worktreeDir = tempDir();
+  const configPath = join(tempDir(), "config.toml");
+  writeFileSync(
+    configPath,
+    `worktree_root = "${worktreeDir}"
+retry_budget = 9
+`,
+  );
+  const { exitCode, stdout, stderr } = runCli(["task", "list"], {
+    QUAY_DATA_DIR: dataDir,
+    QUAY_CONFIG_FILE: configPath,
+  });
+  expect(stderr).toBe("");
+  expect(exitCode).toBe(0);
+  expect(stdout.trim()).toBe("[]");
+});
+
 test("CLI fails loudly when the config file is invalid (does not silently use defaults)", () => {
   const dataDir = tempDir();
   const configPath = join(tempDir(), "config.toml");

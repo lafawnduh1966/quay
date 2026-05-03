@@ -144,14 +144,27 @@ export class GitHubCliAdapter implements GitHubPort {
         `gh pr list --head ${branch} --state ${state} failed: ${result.stderr.trim()}`,
       );
     }
+    let parsed: unknown;
     try {
-      const parsed = JSON.parse(result.stdout);
-      return Array.isArray(parsed) ? parsed : [];
+      parsed = JSON.parse(result.stdout);
     } catch (err) {
       throw new Error(
         `gh pr list returned unparseable JSON for ${branch}: ${(err as Error).message}`,
       );
     }
+    // Fail closed on a non-array body. `gh pr list --json number` is
+    // contractually an array; anything else (object, null, scalar) is a
+    // schema/CLI anomaly. Coercing it to `[]` would make a malformed
+    // response look like "no PR" — cancel would delete a remote branch
+    // that should be retained for an open PR, and enqueue would skip the
+    // open-PR collision check. Same fail-closed posture as `prCheckStatus`
+    // already takes for `gh pr checks`.
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `gh pr list returned non-array JSON for ${branch}: ${result.stdout.trim().slice(0, 200)}`,
+      );
+    }
+    return parsed;
   }
 
   private fetchPrView(

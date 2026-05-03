@@ -36,7 +36,11 @@ async function main(): Promise<number> {
     config.data_dir ??
     join(homedir(), ".quay");
   const reposRoot = join(dataDir, "repos");
-  const worktreesRoot = join(dataDir, "worktrees");
+  // Spec §13: `worktree_root` defaults to `${data_dir}/worktrees`. The config
+  // override is honored verbatim (operator-controlled absolute path), with
+  // the same precedence as `tick_lock_path` — config wins over the derived
+  // default; there is no env override for this knob.
+  const worktreesRoot = config.worktree_root ?? join(dataDir, "worktrees");
   const artifactsRoot = join(dataDir, "artifacts");
   for (const d of [dataDir, reposRoot, worktreesRoot, artifactsRoot]) {
     mkdirSync(d, { recursive: true });
@@ -79,6 +83,9 @@ async function main(): Promise<number> {
     ),
     paths: { reposRoot, worktreesRoot, artifactsRoot },
     tickOptions: tickOptionsFromConfig(config),
+    ...(config.retry_budget !== undefined
+      ? { retryBudget: config.retry_budget }
+      : {}),
   };
 
   const io = {

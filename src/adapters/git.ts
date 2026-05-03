@@ -159,14 +159,25 @@ export class LocalGitAdapter implements GitPort {
       "number",
     ]);
     if (result.exitCode === 0) {
+      let parsed: unknown;
       try {
-        const parsed = JSON.parse(result.stdout);
-        return Array.isArray(parsed) && parsed.length > 0;
+        parsed = JSON.parse(result.stdout);
       } catch (err) {
         throw new Error(
           `gh pr list returned unparseable JSON for ${branch}: ${(err as Error).message}`,
         );
       }
+      // Fail closed on non-array bodies. The `--json number` contract is an
+      // array; anything else (object, null, scalar) is a CLI/schema anomaly,
+      // and coercing it to "no open PR" would silently bypass the spec §12
+      // collision check on every retry — exactly the regression invariant 2
+      // above guards against.
+      if (!Array.isArray(parsed)) {
+        throw new Error(
+          `gh pr list returned non-array JSON for ${repoId} ${branch}: ${result.stdout.trim().slice(0, 200)}`,
+        );
+      }
+      return parsed.length > 0;
     }
     // `Bun.spawnSync` reports a missing executable either by throwing
     // ENOENT (caught in `runIn` and forwarded as exitCode -1) or, on some

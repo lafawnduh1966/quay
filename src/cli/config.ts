@@ -30,7 +30,9 @@ const positiveInt = z.number().int().positive();
 export const ConfigSchema = z
   .object({
     data_dir: z.string().min(1).optional(),
+    worktree_root: z.string().min(1).optional(),
     max_concurrent: positiveInt.optional(),
+    retry_budget: positiveInt.optional(),
     agent_invocation: z.string().min(1).optional(),
     max_attempt_duration_seconds: positiveInt.optional(),
     staleness_threshold_seconds: positiveInt.optional(),
