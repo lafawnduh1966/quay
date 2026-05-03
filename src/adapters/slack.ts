@@ -161,9 +161,14 @@ export class SlackAdapter implements SlackPort {
           };
     // SlackPort is synchronous (every tick handler relies on it) but Bun's
     // `fetch` is async-only, so we run the HTTP call in a child Bun
-    // process and `spawnSync`-wait on it. The token is passed via the
-    // child's env, never argv — argv is visible in `ps`/`/proc/<pid>/cmdline`
-    // for the child's lifetime.
+    // process and `spawnSync`-wait on it. ALL request fields (token, URL,
+    // body) are passed via the child's env — argv is visible in `ps` /
+    // `/proc/<pid>/cmdline` for the child's lifetime, so anything routed
+    // through argv leaks the message text (escalation question, blocker
+    // excerpt, dedupe nonce) and the GET query (channel id, parent thread
+    // ts) to any local reader on a multi-tenant host. Only the http method
+    // (POST/GET) stays on argv since it is a fixed enum with no operator
+    // content.
     //
     // The child wraps `fetch` in an AbortController gated on
     // `QUAY_SLACK_TIMEOUT_MS` so a stalled HTTP connection aborts cleanly
@@ -175,15 +180,16 @@ export class SlackAdapter implements SlackPort {
         process.execPath,
         "-e",
         slackFetchScript(),
-        url,
         init.method ?? "GET",
-        init.body !== undefined && init.body !== null
-          ? String(init.body)
-          : "",
       ],
       env: {
         ...process.env,
         QUAY_SLACK_TOKEN: token,
+        QUAY_SLACK_URL: url,
+        QUAY_SLACK_BODY:
+          init.body !== undefined && init.body !== null
+            ? String(init.body)
+            : "",
         QUAY_SLACK_TIMEOUT_MS: String(this.timeoutMs),
       },
       stdout: "pipe",
@@ -257,19 +263,26 @@ function resolveTimeoutFromEnv(): number {
   return Math.floor(parsed);
 }
 
-// Child-process script: argv = [_, _, url, method, body]; the token comes
-// in via the `QUAY_SLACK_TOKEN` env var so it never appears in `ps` output.
-// `QUAY_SLACK_TIMEOUT_MS` bounds how long the child waits on `fetch` before
-// aborting and exiting non-zero — the supervisor lock is held for the
-// duration of this call, so an unbounded fetch would block `quay cancel`
-// and the next tick. Errors print to stderr and exit non-zero. Embedded as
-// a string so the parent never needs a separate file.
+// Child-process script: argv = [_, _, method]; everything sensitive
+// (token, URL with query string, body) comes in via env vars so it
+// never appears in `ps` / `/proc/<pid>/cmdline`. `QUAY_SLACK_TIMEOUT_MS`
+// bounds how long the child waits on `fetch` before aborting and
+// exiting non-zero — the supervisor lock is held for the duration of
+// this call, so an unbounded fetch would block `quay cancel` and the
+// next tick. Errors print to stderr and exit non-zero. Embedded as a
+// string so the parent never needs a separate file.
 function slackFetchScript(): string {
   return `
-const [url, method, body] = process.argv.slice(1);
+const [method] = process.argv.slice(1);
 const token = process.env.QUAY_SLACK_TOKEN || "";
+const url = process.env.QUAY_SLACK_URL || "";
+const body = process.env.QUAY_SLACK_BODY || "";
 if (!token) {
   process.stderr.write("QUAY_SLACK_TOKEN not set in child env");
+  process.exit(1);
+}
+if (!url) {
+  process.stderr.write("QUAY_SLACK_URL not set in child env");
   process.exit(1);
 }
 const timeoutMs = Number(process.env.QUAY_SLACK_TIMEOUT_MS || "30000");

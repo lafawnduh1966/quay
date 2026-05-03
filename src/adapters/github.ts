@@ -77,13 +77,16 @@ export class GitHubCliAdapter implements GitHubPort {
 
   closePr(repoId: string, branch: string): void {
     // Idempotent per spec §5: a closed/merged PR or a missing PR is a no-op.
+    // Match only PR-scoped phrasings — a bare `not found` substring would
+    // also match repo-level 404s, auth-scope errors, and any Go-internal
+    // ENOENT bubbling through gh, masking real failures as benign no-ops.
     const result = this.run(repoId, ["gh", "pr", "close", branch]);
     if (result.exitCode === 0) return;
     const msg = `${result.stdout}\n${result.stderr}`.toLowerCase();
     if (
       msg.includes("already closed") ||
       msg.includes("no pull request") ||
-      msg.includes("not found")
+      msg.includes("no pull requests")
     ) {
       return;
     }
@@ -192,10 +195,14 @@ export class GitHubCliAdapter implements GitHubPort {
     if (result.exitCode !== 0) {
       // `gh pr view` exits non-zero with "no pull requests found" when no PR
       // exists for the branch — that's the spec-defined "no PR" case, not an
-      // error condition.
+      // error condition. Match PR-scoped phrasings only — a bare `not found`
+      // substring would also match repo-level 404s and auth-scope errors,
+      // silently disabling the spec §5 stale-SHA gate downstream by routing
+      // a transient API error to a null snapshot.
+      const lower = result.stderr.toLowerCase();
       if (
-        result.stderr.toLowerCase().includes("no pull request") ||
-        result.stderr.toLowerCase().includes("not found")
+        lower.includes("no pull request") ||
+        lower.includes("no pull requests")
       ) {
         return null;
       }
@@ -333,10 +340,17 @@ export class GitHubCliAdapter implements GitHubPort {
       "headRefOid",
     ]);
     if (result.exitCode !== 0) {
+      // PR-scoped phrasing only. The bracketing `headRefOid` read is the
+      // load-bearing input to the spec §5/§12 stale-SHA gate — if a bare
+      // `not found` substring caught a transient GraphQL 404 here, the
+      // caller's `?? headShaBefore` fallback in `prSnapshot` would silently
+      // make the bracket SHAs match and let `classifyCi` transition on
+      // possibly-stale checks. Failing closed surfaces a `tick_error`
+      // instead.
       const lower = result.stderr.toLowerCase();
       if (
         lower.includes("no pull request") ||
-        lower.includes("not found")
+        lower.includes("no pull requests")
       ) {
         return null;
       }
@@ -663,9 +677,13 @@ function noChecksPhraseIn(lower: string): boolean {
 }
 
 function noRequiredChecksPhraseIn(lower: string): boolean {
+  // Anchored to "checks" / "check runs" only — a bare "no required"
+  // substring would also match unrelated gh diagnostics like "no required
+  // permissions" or "no required scope", routing real failures to an empty
+  // required-set and letting the spec §5 fallback ("no required checks
+  // → pass") fire on transient gh errors.
   return (
     lower.includes("no required checks") ||
-    lower.includes("no required") ||
     lower.includes("no check runs") ||
     lower.includes("no checks")
   );

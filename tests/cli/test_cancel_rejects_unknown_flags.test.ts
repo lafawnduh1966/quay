@@ -97,6 +97,66 @@ test("cancel with a misspelled --keep-worktre rejects usage_error and runs no de
   expect(eventsAfter).toBe(eventsBefore);
 });
 
+test("cancel rejects the --flag=value form for --keep-worktree / --close-pr and runs no destructive side effects", async () => {
+  // The unknown-flag validator strips `=value` before the membership check,
+  // so `--keep-worktree=true` passes that gate. But the detector below uses
+  // `argv.includes("--keep-worktree")` (exact-match), which returns false
+  // for the element `--keep-worktree=true` — net result is the destructive
+  // cancel path runs anyway and deletes the worktree the operator asked to
+  // preserve. Same hazard for `--close-pr=true`. Reject the `=value` form
+  // outright as a usage_error so the two layers stay aligned.
+  for (const flag of ["--keep-worktree=true", "--close-pr=true"]) {
+    h?.cleanup();
+    h = createHarness();
+    h.clock.set("2026-04-28T10:00:00.000Z");
+    const repoId = insertRepo(h.db, `repo-cancel-eqval-${flag.length}`);
+    const taskId = insertTask(h.db, {
+      taskId: `task-cancel-eqval-${flag.length}`,
+      repoId,
+      state: "running",
+    });
+    insertAttempt(h.db, {
+      taskId,
+      attemptNumber: 1,
+      spawnedAt: "2026-04-28T09:00:00.000Z",
+    });
+
+    const built = buildCliDeps(h);
+    const stateBefore = h.db
+      .query<{ state: string; updated_at: string }, [string]>(
+        `SELECT state, updated_at FROM tasks WHERE task_id = ?`,
+      )
+      .get(taskId)!;
+
+    const io = bufferIO();
+    const result = await dispatch(["cancel", taskId, flag], built.deps, io);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(io.out()).toBe("");
+    const parsed = JSON.parse(io.err().trim());
+    expect(parsed.error).toBe("usage_error");
+    expect(parsed.message).toContain(flag);
+
+    const destructiveGitOps = built.git.calls.filter(
+      (c) =>
+        c.op === "worktreeRemove" ||
+        c.op === "worktreeDetach" ||
+        c.op === "deleteRemoteBranch" ||
+        c.op === "branchDelete",
+    );
+    expect(destructiveGitOps).toHaveLength(0);
+    expect(built.tmux.killCalls).toHaveLength(0);
+
+    const stateAfter = h.db
+      .query<{ state: string; updated_at: string }, [string]>(
+        `SELECT state, updated_at FROM tasks WHERE task_id = ?`,
+      )
+      .get(taskId)!;
+    expect(stateAfter.state).toBe(stateBefore.state);
+    expect(stateAfter.updated_at).toBe(stateBefore.updated_at);
+  }
+});
+
 test("cancel still accepts the spelled-correctly --keep-worktree and --close-pr flags", async () => {
   // Sanity check that the unknown-flag guard didn't accidentally reject
   // the legitimate flags. We point at a non-existent task so the call

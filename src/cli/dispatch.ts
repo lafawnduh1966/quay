@@ -463,16 +463,32 @@ function handleCancel(
   // worktree-removing cancel because `--keep-worktree` evaluates false,
   // costing the operator the on-disk state they wanted to preserve. Reject
   // any unknown long flag before invoking the finalizer.
+  //
+  // Boolean-flag detection below uses exact-match `argv.includes`, so the
+  // validator must also reject the `--flag=value` form: `--keep-worktree=true`
+  // would otherwise pass the membership check (we strip `=value` for that)
+  // but get ignored by the detector, leaving the operator with the SAME
+  // silent-flag-ignore failure mode this validator was added to prevent.
+  // These flags carry no value; reject any `--keep-worktree=...` /
+  // `--close-pr=...` outright with a usage_error.
   const allowedCancelFlags = new Set(["--close-pr", "--keep-worktree"]);
-  const unknown = argv.find(
-    (a) =>
-      a.startsWith("--") &&
-      !allowedCancelFlags.has(a.includes("=") ? a.slice(0, a.indexOf("=")) : a),
-  );
-  if (unknown !== undefined) {
-    return writeError(io, "usage_error", `unknown cancel flag: ${unknown}`, {
-      flag: unknown,
-    });
+  for (const a of argv) {
+    if (!a.startsWith("--")) continue;
+    const eq = a.indexOf("=");
+    const head = eq === -1 ? a : a.slice(0, eq);
+    if (!allowedCancelFlags.has(head)) {
+      return writeError(io, "usage_error", `unknown cancel flag: ${a}`, {
+        flag: a,
+      });
+    }
+    if (eq !== -1) {
+      return writeError(
+        io,
+        "usage_error",
+        `${head} is a boolean flag and does not take a value (got ${a})`,
+        { flag: a },
+      );
+    }
   }
   const closePr = argv.includes("--close-pr");
   const keepWorktree = argv.includes("--keep-worktree");
