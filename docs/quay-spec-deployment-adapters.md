@@ -436,6 +436,7 @@ Linear tickets that are Quay-eligible carry a single fenced block in their body 
 
 ````
 ```quay-config
+repo: iTRY-monorepo
 tags:
   - auth-session
   - cache
@@ -452,6 +453,7 @@ authors:
 
 | Field | Required | Type | Notes |
 |---|---|---|---|
+| `repo` | yes | string | Target repo ID, must match a repo registered with `quay repo add`. Charset is `[A-Za-z0-9._-]+` (same as the registry's `repo_id`); `.` and `..` are rejected as path-traversal sentinels. Lets `quay enqueue --linear-issue ENG-XXXX` work without an external "Linear team → repo" mapping; explicit `--repo` on the CLI still wins as an override. |
 | `tags` | yes | list of strings | Parser only checks the type (list-of-strings). Charset (`lowercase_alphanum_dash`) and emptiness are checked **by the validator**, not the parser, so all tag-shape rules live in one place (`docs/quay-spec-ticket-validation.md` §6). Malformed tags surface as `validation_error` with field path `tags[i]`, not `ticket_block_invalid`. |
 | `slack_thread` | no | URL string | Slack archive URL; parser converts to `<channel>:<ts>`. Omit when no thread is associated. |
 | `authors` | yes | list of `{name, slack_id}` | Humans associated with the ticket, **ordered by involvement** (most-involved first). `name` is the human-readable display name; `slack_id` is the bare Slack user ID (e.g., `U06TDC56VJB`, no angle brackets, no `@`). Passed 1:1 to the validator's `authors` field (same shape, no munging) and used to enable `<@slack_id>` mentions when Quay posts escalations into `slack_thread`. Min 1 entry. |
@@ -496,6 +498,7 @@ The shape inside `quay enqueue --linear-issue`:
    ```typescript
    const validatorPayload = {
      body: linearIssue.body,                  // raw Linear ticket body, quay-config block intact
+     repo: ticketContext.repo,                // from the quay-config block; required
      tags: ticketContext.tags,                // already deduped, lower-cased
      authors: ticketContext.authors,          // 1:1, no munging
      external_ref: ticketContext.external_ref,
@@ -552,6 +555,7 @@ concurrently. Need to nail down the invalidation propagation timing.
 - [ ] No race conditions under concurrent invalidation.
 
 ```quay-config
+repo: iTRY-monorepo
 tags:
   - auth-session
   - cache
@@ -573,8 +577,10 @@ The ticket also has two user comments, added after the original description:
 Hermes calls:
 
 ```bash
-quay enqueue --repo iTRY-monorepo --linear-issue ENG-1276
+quay enqueue --linear-issue ENG-1276
 ```
+
+(The target repo `iTRY-monorepo` comes from the ticket's `repo:` field — no external mapping needed. An operator could pass `--repo <id>` to override for a one-off run.)
 
 ### Step 2: Quay assembles context
 

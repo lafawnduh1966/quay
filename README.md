@@ -169,8 +169,9 @@ tasks against a repo, two things have to happen:
 ```bash
 quay tick                                  # one supervisor pass over the queue
 quay enqueue --repo <id> --brief-file <p>  # legacy enqueue (operator-composed brief)
-quay enqueue --repo <id> --linear-issue <ENG-1234>
-                                           # Linear-adapter enqueue (fetch → validate → enqueue)
+quay enqueue --linear-issue <ENG-1234>     # Linear-adapter enqueue (target repo
+                                           # comes from the ticket's `repo:` field;
+                                           # `--repo <id>` is an optional override)
 quay validate-ticket [--ticket-json <p|->] [--schema-file <p>] [--quiet]
                                            # standalone validator: JSON in, JSON out
 quay task get <task_id> | task list        # read commands (deterministic JSON)

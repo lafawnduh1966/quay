@@ -756,6 +756,52 @@ test("test_enqueue_linear_issue_explicit_repo_overrides_ticket_repo", async () =
   expect(taskRow?.repo_id).toBe(OVERRIDE_REPO);
 });
 
+test("test_enqueue_linear_issue_idempotent_repoll_no_cli_repo_skips_linear_call", async () => {
+  // Re-poll of an already-enqueued ticket on the no-`--repo` path must NOT
+  // hit the Linear (or Slack) adapter — pre-fetch lookup by external_ref
+  // alone short-circuits to the existing task. This preserves the
+  // load-bearing property that re-polls don't burn API quota.
+  h = createHarness();
+  const built = buildCliDeps(h);
+  await addRepo(built);
+
+  built.linear.setIssue(
+    makeIssue({
+      block: {
+        repo: REPO_ID,
+        tags: ["foo"],
+        slack_thread: null,
+        authors: [{ name: "F", slack_id: "U001ABCDE" }],
+      },
+    }),
+  );
+
+  // First call — populates the row.
+  const ioA = bufferIO();
+  const a = await dispatch(
+    ["enqueue", "--linear-issue", "ENG-1276"],
+    built.deps,
+    ioA,
+  );
+  expect(a.exitCode).toBe(0);
+  const first = JSON.parse(ioA.out().trim());
+
+  const callsAfterFirst = built.linear.getIssueCalls.length;
+
+  // Second call — must short-circuit before touching Linear.
+  const ioB = bufferIO();
+  const b = await dispatch(
+    ["enqueue", "--linear-issue", "ENG-1276"],
+    built.deps,
+    ioB,
+  );
+  expect(b.exitCode).toBe(0);
+  const second = JSON.parse(ioB.out().trim());
+
+  expect(second.task_id).toBe(first.task_id);
+  expect(built.linear.getIssueCalls.length).toBe(callsAfterFirst);
+});
+
 test("test_enqueue_linear_issue_ticket_missing_repo_fails_via_validator", async () => {
   // When the ticket's quay-config block is missing `repo`, the block parser
   // throws ticket_block_invalid before the validator is invoked.

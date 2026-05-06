@@ -23,8 +23,8 @@ description = "Slack thread reference: <channel_id>:<message_ts>. Optional: tick
 [required.repo]
 type = "string"
 min_length = 1
-charset = "lowercase_alphanum_dash"
-description = "Target repo ID. Must match a repo registered with `quay repo add`. Mirrors the quay-config block's `repo:` field 1:1."
+pattern = '^[A-Za-z0-9._-]+$'
+description = "Target repo ID. Must match a repo registered with `quay repo add`. Mirrors the quay-config block's `repo:` field 1:1, and the charset matches `repoIdSchema` in src/core/repos/schema.ts so existing deployments with uppercase, `.`, or `_` repo IDs are not silently locked out."
 
 [required.authors]
 type = "list"

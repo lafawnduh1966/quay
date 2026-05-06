@@ -21,7 +21,11 @@ const FENCE_OPEN = /^[ \t]*```quay-config[ \t]*$/;
 const FENCE_CLOSE = /^[ \t]*```[ \t]*$/;
 const SLACK_URL = /^https:\/\/[^.]+\.slack\.com\/archives\/([^/]+)\/p(\d+)$/;
 const SLACK_USER_ID = /^U[A-Z0-9]+$/;
-const REPO_ID = /^[a-z0-9-]+$/;
+// Matches the `repo_id` charset accepted by the registry (src/core/repos/schema.ts).
+// We deliberately do NOT narrow it (e.g. to `[a-z0-9-]+`): existing deployments
+// register repos with uppercase, `.`, or `_`, and a stricter ticket charset
+// would silently lock them out of ticket-supplied repos.
+const REPO_ID = /^[A-Za-z0-9._-]+$/;
 const KEY_VALUE = /^([A-Za-z_][\w-]*)\s*:\s*(.*)$/;
 
 interface FencedBlock {
@@ -275,8 +279,15 @@ function validateBlock(yaml: { [key: string]: YamlValue }): QuayConfigBlock {
   if (typeof rawRepo !== "string" || rawRepo.length === 0) {
     throw blockError("repo must be a non-empty string");
   }
-  if (!REPO_ID.test(rawRepo)) {
-    throw blockError("repo must contain only lowercase letters, digits, and hyphens");
+  if (!REPO_ID.test(rawRepo) || rawRepo === "." || rawRepo === "..") {
+    // Mirrors src/core/repos/schema.ts: charset [A-Za-z0-9._-]+, no
+    // path-traversal sentinels. Deliberately does not duplicate the registry's
+    // existence check here — that lives in the enqueue path, where a missing
+    // repo surfaces as a clear `repo_not_registered` error rather than a parse
+    // failure.
+    throw blockError(
+      "repo must match [A-Za-z0-9._-]+ and cannot be '.' or '..'",
+    );
   }
   const repo = rawRepo;
 

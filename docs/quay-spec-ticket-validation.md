@@ -324,6 +324,12 @@ type = "string"
 pattern = '^[A-Z0-9]+:\d+\.\d+$'
 description = "Slack thread reference: <channel_id>:<message_ts>. Optional: tickets without an originating Slack discussion can omit it. Escalation degrades cleanly to a no-op when absent (per substrate spec, src/core/tick.ts:1019)."
 
+[required.repo]
+type = "string"
+min_length = 1
+pattern = '^[A-Za-z0-9._-]+$'
+description = "Target repo ID. Must match a repo registered with `quay repo add`. Mirrors the quay-config block's `repo:` field 1:1, and the charset matches `repoIdSchema` in src/core/repos/schema.ts so existing deployments with uppercase, `.`, or `_` repo IDs are not silently locked out."
+
 [required.authors]
 type = "list"
 item_type = "object"

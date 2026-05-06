@@ -39,9 +39,16 @@ export function handleEnqueueLinearIssue(
   deps: EnqueueLinearIssueDeps,
   io: CliIO,
 ): DispatchResult {
-  // Idempotency check: when an explicit --repo was given we can check before
-  // fetching the ticket. When repo comes from the ticket, we defer the check
-  // until after context assembly.
+  // Pre-fetch idempotency: when an explicit --repo was given we look up
+  // (repo, external_ref) directly. When --repo is absent we'd normally have to
+  // fetch the ticket first to learn the repo — but Linear identifiers
+  // (ENG-1234, AST-79, …) are globally unique within a workspace, so a unique
+  // row by `external_ref` alone is reliably idempotent. Short-circuiting on
+  // that match preserves the load-bearing property "a re-poll of an already-
+  // enqueued ticket doesn't burn Linear / Slack API quota" on the canonical
+  // hermes-agent path. If the lookup returns 0 rows the ticket fetch is
+  // unavoidable; if it returns 2+ rows (cross-source collision in some future
+  // multi-source world) we defer to the post-fetch (repo, external_ref) check.
   const externalRef = args.identifier.toUpperCase();
   if (args.repoId !== null) {
     const existing = lookupExistingTask(
@@ -52,6 +59,22 @@ export function handleEnqueueLinearIssue(
     if (existing !== null) {
       io.stdout(`${JSON.stringify(existing)}\n`);
       return { exitCode: 0 };
+    }
+  } else {
+    const candidates = lookupRepoIdsForExternalRef(
+      deps.enqueueDeps.db,
+      externalRef,
+    );
+    if (candidates.length === 1) {
+      const existing = lookupExistingTask(
+        deps.enqueueDeps.db,
+        candidates[0]!,
+        externalRef,
+      );
+      if (existing !== null) {
+        io.stdout(`${JSON.stringify(existing)}\n`);
+        return { exitCode: 0 };
+      }
     }
   }
 
@@ -223,6 +246,23 @@ function lookupExistingTask(
     worktree_path: row.worktree_path,
     attempt_id: attempt?.attempt_id ?? 0,
   };
+}
+
+// Pre-fetch helper for the no-`--repo` path. Returns the repo_ids of every
+// task currently bearing this external_ref. The unique index is
+// (repo_id, external_ref), so 2+ rows imply a cross-source collision — rare
+// in v1 (Linear-only) but the caller defers to a post-fetch check rather
+// than guessing.
+function lookupRepoIdsForExternalRef(
+  db: DB,
+  externalRef: string,
+): string[] {
+  return db
+    .query<{ repo_id: string }, [string]>(
+      `SELECT repo_id FROM tasks WHERE external_ref = ?`,
+    )
+    .all(externalRef)
+    .map((r) => r.repo_id);
 }
 
 function emitError(io: CliIO, err: unknown): DispatchResult {

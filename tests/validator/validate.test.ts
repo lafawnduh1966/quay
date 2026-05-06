@@ -546,18 +546,20 @@ test("test_validate_ticket_repo_missing_emits_missing_error", () => {
   expect(missing).toHaveLength(1);
 });
 
-test("test_validate_ticket_repo_charset_violation_emits_charset_error", () => {
-  // repo must satisfy lowercase_alphanum_dash. Uppercase or spaces must fail.
-  const { io, run } = pipeJson({ ...VALID_DRAFT, repo: "My_Repo" });
+test("test_validate_ticket_repo_pattern_violation_emits_pattern_error", () => {
+  // repo accepts the same charset as the registry's `repo_id` schema
+  // (`[A-Za-z0-9._-]+`), so uppercase, dots, and underscores are all OK.
+  // Whitespace and path separators are not — those must surface as PATTERN.
+  const { io, run } = pipeJson({ ...VALID_DRAFT, repo: "has space" });
   const result = run();
   expect(result.exitCode).toBe(1);
   const out = JSON.parse(io.out().trim());
   expect(out.valid).toBe(false);
-  const charsetErr = out.errors.find(
+  const patternErr = out.errors.find(
     (e: { field: string; code: string }) =>
-      e.field === "repo" && e.code === "CHARSET",
+      e.field === "repo" && e.code === "PATTERN",
   );
-  expect(charsetErr).toBeDefined();
+  expect(patternErr).toBeDefined();
 });
 
 test("test_validate_ticket_repo_present_and_valid_passes", () => {
