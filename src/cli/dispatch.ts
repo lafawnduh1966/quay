@@ -567,11 +567,12 @@ function handleRepoList(
   service: ReturnType<typeof createRepoService>,
   io: CliIO,
 ): DispatchResult {
-  const active = readBooleanFlag(argv, "--active");
-  if (!active.ok) return writeError(io, "usage_error", active.message);
-  io.stdout(
-    `${JSON.stringify(service.list({ activeOnly: active.value }))}\n`,
-  );
+  const validation = validateFlags(argv, { boolean: ["--active"] });
+  if (!validation.ok) {
+    return writeError(io, "usage_error", validation.message, validation.details);
+  }
+  const activeOnly = argv.includes("--active");
+  io.stdout(`${JSON.stringify(service.list({ activeOnly }))}\n`);
   return { exitCode: 0 };
 }
 
@@ -580,10 +581,16 @@ function handleRepoExport(
   service: ReturnType<typeof createRepoService>,
   io: CliIO,
 ): DispatchResult {
-  const active = readBooleanFlag(argv, "--active");
-  if (!active.ok) return writeError(io, "usage_error", active.message);
+  const validation = validateFlags(argv, {
+    boolean: ["--active"],
+    valued: ["--out"],
+  });
+  if (!validation.ok) {
+    return writeError(io, "usage_error", validation.message, validation.details);
+  }
   const out = readFlag(argv, "--out");
-  const rows = service.list({ activeOnly: active.value });
+  const activeOnly = argv.includes("--active");
+  const rows = service.list({ activeOnly });
   const body = JSON.stringify(rows);
   if (out !== null) {
     try {
@@ -666,34 +673,15 @@ function handleCancel(
   // optionally closes the PR). A misspelled flag must NOT be silently
   // ignored — `cancel --keep-worktre` would otherwise behave like a
   // worktree-removing cancel because `--keep-worktree` evaluates false,
-  // costing the operator the on-disk state they wanted to preserve. Reject
-  // any unknown long flag before invoking the finalizer.
-  //
-  // Boolean-flag detection below uses exact-match `argv.includes`, so the
-  // validator must also reject the `--flag=value` form: `--keep-worktree=true`
-  // would otherwise pass the membership check (we strip `=value` for that)
-  // but get ignored by the detector, leaving the operator with the SAME
-  // silent-flag-ignore failure mode this validator was added to prevent.
-  // These flags carry no value; reject any `--keep-worktree=...` /
-  // `--close-pr=...` outright with a usage_error.
-  const allowedCancelFlags = new Set(["--close-pr", "--keep-worktree"]);
-  for (const a of argv) {
-    if (!a.startsWith("--")) continue;
-    const eq = a.indexOf("=");
-    const head = eq === -1 ? a : a.slice(0, eq);
-    if (!allowedCancelFlags.has(head)) {
-      return writeError(io, "usage_error", `unknown cancel flag: ${a}`, {
-        flag: a,
-      });
-    }
-    if (eq !== -1) {
-      return writeError(
-        io,
-        "usage_error",
-        `${head} is a boolean flag and does not take a value (got ${a})`,
-        { flag: a },
-      );
-    }
+  // costing the operator the on-disk state they wanted to preserve. The
+  // shared `validateFlags` helper rejects unknown flags AND the
+  // `--keep-worktree=true` / `--close-pr=true` forms (which would otherwise
+  // pass `argv.includes` but get ignored by the boolean detector).
+  const validation = validateFlags(argv, {
+    boolean: ["--close-pr", "--keep-worktree"],
+  });
+  if (!validation.ok) {
+    return writeError(io, "usage_error", validation.message, validation.details);
   }
   const closePr = argv.includes("--close-pr");
   const keepWorktree = argv.includes("--keep-worktree");
@@ -973,29 +961,66 @@ function tryParseJsonFlag(argv: string[]): ParseResult {
   }
 }
 
-// Reads a boolean flag. Returns true when bare `--flag` is present, false
-// when absent. Rejects `--flag=<value>` (silent-ignore footgun: an operator
-// who writes `--active=true` would otherwise get the all-rows default and
-// only notice when archived rows leak into their parsing).
-function readBooleanFlag(
-  argv: string[],
-  flag: string,
-): { ok: true; value: boolean } | { ok: false; message: string } {
-  const eq = `${flag}=`;
-  let found = false;
-  for (const a of argv) {
-    if (a === flag) {
-      found = true;
-      continue;
-    }
-    if (a.startsWith(eq)) {
+// Validates argv flag tokens against an allowlist before any handler-level
+// reads. Closes three silent-ignore footguns at once:
+//
+//   1. Typo on a flag NAME (`--actv`, `--Active`) — caught as "unknown flag"
+//      instead of falling back to the absent-flag default.
+//   2. `--<bool>=value` form (`--active=true`) — caught instead of being
+//      ignored by the bare-`argv.includes("--active")` boolean detector.
+//   3. Missing value on a `--<valued>` flag (`--out` at end of argv, or
+//      `--out --active`) — caught instead of letting `readFlag` swallow the
+//      next `--` token (or undefined) as the path.
+//
+// Long-flag tokens only — short flags and positionals are ignored.
+interface FlagSpec {
+  boolean?: ReadonlyArray<string>;
+  valued?: ReadonlyArray<string>;
+}
+type FlagValidation =
+  | { ok: true }
+  | { ok: false; message: string; details: { flag: string } };
+function validateFlags(argv: string[], spec: FlagSpec): FlagValidation {
+  const known = new Set<string>([
+    ...(spec.boolean ?? []),
+    ...(spec.valued ?? []),
+  ]);
+  const booleans = new Set<string>(spec.boolean ?? []);
+  const valueds = new Set<string>(spec.valued ?? []);
+  for (let i = 0; i < argv.length; i += 1) {
+    const a = argv[i];
+    if (a === undefined || !a.startsWith("--")) continue;
+    const eq = a.indexOf("=");
+    const head = eq === -1 ? a : a.slice(0, eq);
+    if (!known.has(head)) {
       return {
         ok: false,
-        message: `${flag} is a boolean flag and does not take a value (got ${a})`,
+        message: `unknown flag: ${a}`,
+        details: { flag: a },
       };
     }
+    if (booleans.has(head)) {
+      if (eq !== -1) {
+        return {
+          ok: false,
+          message: `${head} is a boolean flag and does not take a value (got ${a})`,
+          details: { flag: a },
+        };
+      }
+      continue;
+    }
+    if (valueds.has(head) && eq === -1) {
+      const next = argv[i + 1];
+      if (next === undefined || next.startsWith("--")) {
+        return {
+          ok: false,
+          message: `${head} requires a value`,
+          details: { flag: head },
+        };
+      }
+    }
   }
-  return { ok: true, value: found };
+  return { ok: true };
 }
 
 // Reads `--flag <value>` or `--flag=<value>`. Returns null when absent.

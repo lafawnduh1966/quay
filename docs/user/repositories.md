@@ -74,13 +74,19 @@ fields precisely.
 
 ```bash
 quay repo list
+quay repo list --active
 quay repo export
+quay repo export --active
 quay repo export --out repos.json
 quay repo import --in repos.json
 ```
 
-`repo list` includes archived repos. `repo import` upserts rows and is intended
-for restore workflows.
+`repo list` and `repo export` default to all rows, archived included, so
+operators debugging "where did my repo go?" still see soft-deleted entries
+and a `repo export` dump remains full-fidelity for restore. Pass `--active`
+to either command to limit the output to repos with `archived_at IS NULL` —
+the typical "which repos are in service?" question. `repo import` upserts
+rows and is intended for restore workflows.
 
 ## Remove A Repo
 

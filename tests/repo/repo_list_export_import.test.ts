@@ -396,6 +396,74 @@ test("repo list --active=value is rejected with usage_error (no silent ignore)",
   expect(parsed.message).toMatch(/--active/);
 });
 
+// Reviewer feedback on PR #24: a typo on the flag NAME (not just the value)
+// is the same silent-ignore footgun the ticket calls out — a user typing
+// `--actv` would otherwise get all rows back. Match `cancel`'s allowlist
+// pattern: unknown long flags are a hard usage_error.
+test("repo list rejects unknown / typo'd flags instead of silently returning all rows", async () => {
+  h = createHarness();
+  const built = buildCliDeps(h);
+  // Pre-seed with an archived row so a silent-ignore would be observable
+  // (the test would see the archived row in the output).
+  await addRepo(built, "repo-live-typo");
+  await addRepo(built, "repo-archived-typo");
+  await dispatch(
+    ["repo", "remove", "repo-archived-typo"],
+    built.deps,
+    bufferIO(),
+  );
+
+  for (const flag of ["--actv", "--Active", "--act"]) {
+    const io = bufferIO();
+    const result = await dispatch(["repo", "list", flag], built.deps, io);
+    expect(result.exitCode).toBe(1);
+    expect(io.out()).toBe("");
+    const parsed = JSON.parse(io.err());
+    expect(parsed.error).toBe("usage_error");
+    expect(parsed.message).toContain(flag);
+  }
+});
+
+test("repo export rejects unknown flags and missing values for --out", async () => {
+  h = createHarness();
+  const built = buildCliDeps(h);
+
+  // Unknown flag → usage_error.
+  const ioUnknown = bufferIO();
+  const unknownResult = await dispatch(
+    ["repo", "export", "--bogus"],
+    built.deps,
+    ioUnknown,
+  );
+  expect(unknownResult.exitCode).toBe(1);
+  expect(JSON.parse(ioUnknown.err()).error).toBe("usage_error");
+
+  // `--out` with no following value (end of argv) → usage_error. Without
+  // this guard, readFlag silently returns null and the dump goes to stdout
+  // instead of the file the operator asked for.
+  const ioNoValue = bufferIO();
+  const noValueResult = await dispatch(
+    ["repo", "export", "--out"],
+    built.deps,
+    ioNoValue,
+  );
+  expect(noValueResult.exitCode).toBe(1);
+  const noValueParsed = JSON.parse(ioNoValue.err());
+  expect(noValueParsed.error).toBe("usage_error");
+  expect(noValueParsed.message).toMatch(/--out/);
+
+  // `--out --active` (next token is itself a flag) — same hazard:
+  // readFlag would otherwise treat `--active` as the path.
+  const ioFlagAsValue = bufferIO();
+  const flagAsValueResult = await dispatch(
+    ["repo", "export", "--out", "--active"],
+    built.deps,
+    ioFlagAsValue,
+  );
+  expect(flagAsValueResult.exitCode).toBe(1);
+  expect(JSON.parse(ioFlagAsValue.err()).error).toBe("usage_error");
+});
+
 test("repo export --active filters archived rows in both stdout and --out modes", async () => {
   h = createHarness();
   const built = buildCliDeps(h);

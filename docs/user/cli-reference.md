@@ -57,13 +57,20 @@ quay repo add \
 quay repo update <repo_id> [flags]
 quay repo update --id <repo_id> [flags]
 quay repo remove <repo_id>
-quay repo list
-quay repo export [--out <path>]
+quay repo list [--active]
+quay repo export [--out <path>] [--active]
 quay repo import --in <path>
 ```
 
 `repo add` and `repo update` also accept `--input <json>` for structured
 automation.
+
+`repo list` and `repo export` default to returning every row, archived
+included, so operators debugging "where did my repo go?" still see
+soft-deleted entries (and `repo export` keeps full-fidelity backup
+semantics). Pass `--active` to limit the output to rows with
+`archived_at IS NULL` — the typical "which repos are in service?"
+question that consumers like `setup-hermes.sh` ask.
 
 ## Enqueue
 
