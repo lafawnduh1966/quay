@@ -154,14 +154,28 @@ const COMMANDS: Record<string, CommandSpec> = {
   },
   "repo list": {
     path: "repo list",
-    synopsis: "quay repo list",
+    synopsis: "quay repo list [--active]",
     summary: "Print all repo rows as a JSON array.",
+    details:
+      "By default lists every row, archived included (so operators can see soft-deleted repos). Pass --active to limit the output to repos with archived_at IS NULL — the typical \"which repos are in service?\" question.",
+    flags: [
+      {
+        flag: "--active",
+        desc: "Only return rows where archived_at IS NULL.",
+      },
+    ],
   },
   "repo export": {
     path: "repo export",
-    synopsis: "quay repo export [--out <path>]",
+    synopsis: "quay repo export [--out <path>] [--active]",
     summary: "Dump the repo registry as JSON. Default writes to stdout.",
-    flags: [{ flag: "--out <path>", desc: "Write the dump to <path> instead of stdout." }],
+    flags: [
+      { flag: "--out <path>", desc: "Write the dump to <path> instead of stdout." },
+      {
+        flag: "--active",
+        desc: "Only export rows where archived_at IS NULL.",
+      },
+    ],
   },
   "repo import": {
     path: "repo import",

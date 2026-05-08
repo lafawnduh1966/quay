@@ -334,3 +334,123 @@ test("repo import errors when the file is not a JSON array", async () => {
   expect(parsed.error).toBe("usage_error");
   expect(parsed.message).toMatch(/array/i);
 });
+
+// AST-84: --active filters archived rows. Default still includes them so
+// operators debugging "where did my repo go?" can see soft-deleted entries.
+test("repo list --active filters out archived rows; default keeps them", async () => {
+  h = createHarness();
+  const built = buildCliDeps(h);
+  await addRepo(built, "repo-keep");
+  await addRepo(built, "repo-archived");
+  // Soft-delete one row.
+  const removeIO = bufferIO();
+  const removeResult = await dispatch(
+    ["repo", "remove", "repo-archived"],
+    built.deps,
+    removeIO,
+  );
+  expect(removeResult.exitCode).toBe(0);
+
+  // Default: both rows visible.
+  const allIO = bufferIO();
+  const allResult = await dispatch(["repo", "list"], built.deps, allIO);
+  expect(allResult.exitCode).toBe(0);
+  const all = JSON.parse(allIO.out()) as Array<{
+    repo_id: string;
+    archived_at: string | null;
+  }>;
+  expect(all.map((r) => r.repo_id)).toEqual(["repo-archived", "repo-keep"]);
+  expect(all.find((r) => r.repo_id === "repo-archived")?.archived_at).not.toBe(
+    null,
+  );
+
+  // --active: archived row hidden.
+  const activeIO = bufferIO();
+  const activeResult = await dispatch(
+    ["repo", "list", "--active"],
+    built.deps,
+    activeIO,
+  );
+  expect(activeResult.exitCode).toBe(0);
+  const active = JSON.parse(activeIO.out()) as Array<{
+    repo_id: string;
+    archived_at: string | null;
+  }>;
+  expect(active.map((r) => r.repo_id)).toEqual(["repo-keep"]);
+  expect(active.every((r) => r.archived_at === null)).toBe(true);
+});
+
+test("repo list --active=value is rejected with usage_error (no silent ignore)", async () => {
+  h = createHarness();
+  const built = buildCliDeps(h);
+  const io = bufferIO();
+  const result = await dispatch(
+    ["repo", "list", "--active=true"],
+    built.deps,
+    io,
+  );
+  expect(result.exitCode).toBe(1);
+  expect(io.out()).toBe("");
+  const parsed = JSON.parse(io.err());
+  expect(parsed.error).toBe("usage_error");
+  expect(parsed.message).toMatch(/--active/);
+});
+
+test("repo export --active filters archived rows in both stdout and --out modes", async () => {
+  h = createHarness();
+  const built = buildCliDeps(h);
+  await addRepo(built, "repo-live");
+  await addRepo(built, "repo-gone");
+  await dispatch(["repo", "remove", "repo-gone"], built.deps, bufferIO());
+
+  // stdout mode.
+  const stdoutIO = bufferIO();
+  const stdoutResult = await dispatch(
+    ["repo", "export", "--active"],
+    built.deps,
+    stdoutIO,
+  );
+  expect(stdoutResult.exitCode).toBe(0);
+  const stdoutDump = JSON.parse(stdoutIO.out()) as Array<{
+    repo_id: string;
+  }>;
+  expect(stdoutDump.map((r) => r.repo_id)).toEqual(["repo-live"]);
+
+  // --out mode: file contains active-only, summary count matches.
+  const dumpPath = join(tempDir(), "active.json");
+  const outIO = bufferIO();
+  const outResult = await dispatch(
+    ["repo", "export", "--out", dumpPath, "--active"],
+    built.deps,
+    outIO,
+  );
+  expect(outResult.exitCode).toBe(0);
+  const onDisk = JSON.parse(readFileSync(dumpPath, "utf8"));
+  expect(onDisk.map((r: { repo_id: string }) => r.repo_id)).toEqual([
+    "repo-live",
+  ]);
+  expect(JSON.parse(outIO.out())).toEqual({ out: dumpPath, count: 1 });
+});
+
+test("repo export default still emits archived rows (full-fidelity restore)", async () => {
+  h = createHarness();
+  const built = buildCliDeps(h);
+  await addRepo(built, "repo-still-here");
+  await addRepo(built, "repo-tombstoned");
+  await dispatch(["repo", "remove", "repo-tombstoned"], built.deps, bufferIO());
+
+  const io = bufferIO();
+  const result = await dispatch(["repo", "export"], built.deps, io);
+  expect(result.exitCode).toBe(0);
+  const parsed = JSON.parse(io.out()) as Array<{
+    repo_id: string;
+    archived_at: string | null;
+  }>;
+  expect(parsed.map((r) => r.repo_id).sort()).toEqual([
+    "repo-still-here",
+    "repo-tombstoned",
+  ]);
+  expect(
+    parsed.find((r) => r.repo_id === "repo-tombstoned")?.archived_at,
+  ).not.toBe(null);
+});

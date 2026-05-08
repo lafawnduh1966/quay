@@ -1002,7 +1002,7 @@ No `--json` flag exists or is needed; JSON is the only output format. The pull-l
 | `quay repo add --id <id> --url <url> --base-branch <branch> --package-manager <pm> --install-cmd <cmd> [...flags]` | Register a repo. Errors on duplicate `id`. | Operator |
 | `quay repo update --id <id> [...flags]` | Edit fields on an existing repo row. Errors if `id` is unknown. | Operator |
 | `quay repo remove <id>` | **Soft-delete** the repo: sets `repos.archived_at = now()`. Fails if any non-terminal, non-parked task references it (states checked: `queued`, `running`, `pr-open`, `done`, `awaiting-next-brief`, `claimed-by-orchestrator`, `waiting_human`). Terminal (`merged`, `closed_unmerged`, `cancelled`) and parked (`worktree_error`, `orchestrator_loop`, `non_budget_loop`) tasks are preserved with their `repo_id` intact for forensics; the FK remains satisfied. After archival, `quay enqueue --repo <id>` rejects with "repo archived." `quay repo add` with the same id reactivates by clearing `archived_at` (idempotent restore for `quay repo import`). | Operator |
-| `quay repo export [--out <path>]` | Export the `repos` table as JSON for backup. | Operator |
+| `quay repo export [--out <path>] [--active]` | Export the `repos` table as JSON for backup. Default includes archived rows so a roundtrip restore is full-fidelity. Pass `--active` to dump only rows with `archived_at IS NULL`. | Operator |
 | `quay repo import --in <path>` | Import a `repos` JSON dump. Upserts (idempotent for restore use). | Operator |
 
 ### Read commands
@@ -1013,7 +1013,7 @@ No `--json` flag exists or is needed; JSON is the only output format. The pull-l
 | `quay task list [--state <s>]... [--repo <id>] [--external-ref <ref>]` | Filtered list. `--state` is repeatable for OR-filtering across states (e.g. `--state awaiting-next-brief --state waiting_human`). Output is a single JSON array on stdout, with one task object per element. Empty result is `[]`. |
 | `quay task events <id>` | Append-only event log for a task. |
 | `quay artifact get <task_id> <kind> [--attempt <n>]` | Fetch artifact contents (or path with `--path`). |
-| `quay repo list` | Registered repos. |
+| `quay repo list [--active]` | Registered repos. Default returns every row, archived included, so operators debugging "where did my repo go?" still see soft-deleted rows. Pass `--active` to filter to rows with `archived_at IS NULL` — the common consumer question ("which repos are in service?"). |
 
 ### Idempotency guarantees
 

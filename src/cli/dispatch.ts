@@ -496,7 +496,7 @@ function handleRepo(
     }
     case "list":
       if (wantsHelp(rest)) return printHelp(io, ["repo", "list"]);
-      return handleRepoList(service, io);
+      return handleRepoList(rest, service, io);
     case "export":
       if (wantsHelp(rest)) return printHelp(io, ["repo", "export"]);
       return handleRepoExport(rest, service, io);
@@ -563,10 +563,15 @@ function handleRepoUpdate(
 }
 
 function handleRepoList(
+  argv: string[],
   service: ReturnType<typeof createRepoService>,
   io: CliIO,
 ): DispatchResult {
-  io.stdout(`${JSON.stringify(service.list())}\n`);
+  const active = readBooleanFlag(argv, "--active");
+  if (!active.ok) return writeError(io, "usage_error", active.message);
+  io.stdout(
+    `${JSON.stringify(service.list({ activeOnly: active.value }))}\n`,
+  );
   return { exitCode: 0 };
 }
 
@@ -575,8 +580,11 @@ function handleRepoExport(
   service: ReturnType<typeof createRepoService>,
   io: CliIO,
 ): DispatchResult {
+  const active = readBooleanFlag(argv, "--active");
+  if (!active.ok) return writeError(io, "usage_error", active.message);
   const out = readFlag(argv, "--out");
-  const body = JSON.stringify(service.list());
+  const rows = service.list({ activeOnly: active.value });
+  const body = JSON.stringify(rows);
   if (out !== null) {
     try {
       writeFileSync(out, `${body}\n`, { encoding: "utf8" });
@@ -590,7 +598,7 @@ function handleRepoExport(
     // Stdout still gets the operator-friendly summary, mirroring how `task
     // get` / `repo add` always emit something so a wrapping script can
     // verify success.
-    io.stdout(`${JSON.stringify({ out, count: service.list().length })}\n`);
+    io.stdout(`${JSON.stringify({ out, count: rows.length })}\n`);
     return { exitCode: 0 };
   }
   io.stdout(`${body}\n`);
@@ -963,6 +971,31 @@ function tryParseJsonFlag(argv: string[]): ParseResult {
       message: `invalid JSON for --input: ${(err as Error).message}`,
     };
   }
+}
+
+// Reads a boolean flag. Returns true when bare `--flag` is present, false
+// when absent. Rejects `--flag=<value>` (silent-ignore footgun: an operator
+// who writes `--active=true` would otherwise get the all-rows default and
+// only notice when archived rows leak into their parsing).
+function readBooleanFlag(
+  argv: string[],
+  flag: string,
+): { ok: true; value: boolean } | { ok: false; message: string } {
+  const eq = `${flag}=`;
+  let found = false;
+  for (const a of argv) {
+    if (a === flag) {
+      found = true;
+      continue;
+    }
+    if (a.startsWith(eq)) {
+      return {
+        ok: false,
+        message: `${flag} is a boolean flag and does not take a value (got ${a})`,
+      };
+    }
+  }
+  return { ok: true, value: found };
 }
 
 // Reads `--flag <value>` or `--flag=<value>`. Returns null when absent.

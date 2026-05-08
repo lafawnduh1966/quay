@@ -33,9 +33,12 @@ export interface RepoService {
   update(repoId: string, patch: unknown): RepoRow;
   remove(repoId: string): RepoRow;
   get(repoId: string): RepoRow | null;
-  // Per spec §10 read commands: full registry, archived rows included so
-  // operators can see what's been soft-deleted. Stable order by repo_id.
-  list(): RepoRow[];
+  // Per spec §10 read commands: default returns the full registry (archived
+  // rows included) so operators debugging "where did my repo go?" still see
+  // soft-deleted rows. Pass `{ activeOnly: true }` to filter `archived_at IS
+  // NULL` — the common consumer question ("which repos are in service?").
+  // Stable order by repo_id either way.
+  list(opts?: { activeOnly?: boolean }): RepoRow[];
   // Bulk-restore companion to `add`: spec §10 says `quay repo import` upserts.
   // Unlike `add` (which errors on duplicate, non-archived), `upsert` always
   // writes. When the input row carries `archived_at`/`created_at`, those are
@@ -176,7 +179,16 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
     return get(repoId)!;
   }
 
-  function list(): RepoRow[] {
+  function list(opts?: { activeOnly?: boolean }): RepoRow[] {
+    if (opts?.activeOnly) {
+      return db
+        .query<RepoRow, []>(
+          `SELECT ${SELECT_REPO_COLUMNS} FROM repos
+            WHERE archived_at IS NULL
+            ORDER BY repo_id ASC`,
+        )
+        .all();
+    }
     return db
       .query<RepoRow, []>(
         `SELECT ${SELECT_REPO_COLUMNS} FROM repos ORDER BY repo_id ASC`,
