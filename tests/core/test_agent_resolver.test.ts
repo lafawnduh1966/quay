@@ -136,14 +136,15 @@ test("resolver throws when the repo override names an unregistered agent", () =>
 });
 
 test("createAgentResolver fails at boot when [agents].worker names an unregistered entry", () => {
-  h = createHarness();
+  const harness = createHarness();
+  h = harness;
   // Worker default points at "codex" but no [agents.invocations.codex]
   // block was registered. Without the eager check this would only blow
   // up when the first queued task tried to spawn; with it, the
   // production CLI fails the moment config is loaded.
   expect(() =>
     createAgentResolver({
-      db: h.db,
+      db: harness.db,
       config: {
         agents: {
           worker: "codex",
