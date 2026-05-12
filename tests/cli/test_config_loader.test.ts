@@ -146,6 +146,61 @@ test("falls back to ~/.quay/config.toml when no env vars are set", () => {
   expect(result.config.agent_invocation).toBe("claude --from-default-path");
 });
 
+test("accepts an [agents] block with per-role defaults and per-agent invocations", () => {
+  const dir = tempDir();
+  const path = join(dir, "config.toml");
+  writeFileSync(
+    path,
+    `[agents]
+worker = "claude"
+reviewer = "codex"
+
+[agents.invocations.claude]
+worker = "claude --w < {prompt_file}"
+reviewer = "claude --r < {prompt_file}"
+
+[agents.invocations.codex]
+worker = "codex exec < {prompt_file}"
+reviewer = "codex exec --review < {prompt_file}"
+`,
+  );
+  const result = loadConfig({ env: { QUAY_CONFIG_FILE: path } });
+  expect(result.config.agents?.worker).toBe("claude");
+  expect(result.config.agents?.reviewer).toBe("codex");
+  expect(result.config.agents?.invocations?.claude?.worker).toBe(
+    "claude --w < {prompt_file}",
+  );
+  expect(result.config.agents?.invocations?.codex?.reviewer).toBe(
+    "codex exec --review < {prompt_file}",
+  );
+});
+
+test("rejects an unknown key under [agents] (strict schema, no silent typos)", () => {
+  const dir = tempDir();
+  const path = join(dir, "config.toml");
+  writeFileSync(
+    path,
+    `[agents]
+default = "claude"
+`,
+  );
+  expect(() => loadConfig({ env: { QUAY_CONFIG_FILE: path } })).toThrow(
+    /agents|default|unrecognized/i,
+  );
+});
+
+test("rejects an empty agent invocation string", () => {
+  const dir = tempDir();
+  const path = join(dir, "config.toml");
+  writeFileSync(
+    path,
+    `[agents.invocations.codex]
+worker = ""
+`,
+  );
+  expect(() => loadConfig({ env: { QUAY_CONFIG_FILE: path } })).toThrow();
+});
+
 test("rejects an unknown key (typo'd config refuses to silently fall back)", () => {
   const dir = tempDir();
   const path = join(dir, "config.toml");

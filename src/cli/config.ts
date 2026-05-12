@@ -61,6 +61,31 @@ const ReviewerConfigSchema = z
   })
   .strict();
 
+// `[agents]` block lets the deployment register a per-agent invocation
+// template once (under `[agents.invocations.<name>].worker` /
+// `.reviewer`) and choose one as the global default for each role via
+// `[agents].worker` / `[agents].reviewer`. Per-repo overrides on the
+// `repos` row pick a different registered agent for either role.
+//
+// Legacy compatibility: a top-level `agent_invocation = "..."` continues
+// to work and is treated as `[agents.invocations.claude].worker` with
+// `[agents].worker = "claude"`. The downstream resolver folds the two
+// representations together.
+const AgentInvocationSchema = z
+  .object({
+    worker: z.string().min(1).optional(),
+    reviewer: z.string().min(1).optional(),
+  })
+  .strict();
+
+const AgentsConfigSchema = z
+  .object({
+    worker: z.string().min(1).optional(),
+    reviewer: z.string().min(1).optional(),
+    invocations: z.record(z.string().min(1), AgentInvocationSchema).optional(),
+  })
+  .strict();
+
 export const ConfigSchema = z
   .object({
     data_dir: z.string().min(1).optional(),
@@ -70,6 +95,7 @@ export const ConfigSchema = z
     max_concurrent_reviewers: positiveInt.optional(),
     retry_budget: positiveInt.optional(),
     agent_invocation: z.string().min(1).optional(),
+    agents: AgentsConfigSchema.optional(),
     max_attempt_duration_seconds: positiveInt.optional(),
     staleness_threshold_seconds: positiveInt.optional(),
     max_spawn_failures: positiveInt.optional(),

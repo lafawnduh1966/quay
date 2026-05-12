@@ -25,6 +25,7 @@ import { enqueue, type EnqueueDeps } from "../core/enqueue.ts";
 import type { ValidatorRunner } from "../core/validator_runner.ts";
 import { handleEnqueueLinearIssue } from "./enqueue_linear_issue.ts";
 import type { RepoService } from "../core/repos/service.ts";
+import type { AgentResolver } from "../core/agents.ts";
 import type { TagService, TagVocab } from "../core/tags/service.ts";
 import { mergeVocab } from "../core/tags/merge.ts";
 import { parseImportToml, planImport } from "../core/tags/import_toml.ts";
@@ -94,6 +95,13 @@ export interface CliDeps {
   adaptersConfig?: { linearEnabled: boolean; slackEnabled: boolean };
   repoService: RepoService;
   tagService: TagService;
+  // Resolver for the deployment's `[agents]` block. Worker/reviewer
+  // spawn paths use it to look up the invocation string by
+  // (repo_id, role); the repo-add/update CLI handlers consult its
+  // `registeredAgents()` to reject overrides naming an unregistered
+  // entry. The dispatcher constructs the resolver from `CliDeps.config`
+  // at startup; tests inject a fake.
+  agentResolver: AgentResolver;
 }
 
 export interface DispatchResult {
@@ -357,7 +365,16 @@ async function handleTick(
 ): Promise<DispatchResult> {
   if (wantsHelp(argv)) return printHelp(io, ["tick"]);
   const tickDeps: TickDeps = pickTickDeps(deps);
-  const results = await tick_once(tickDeps, deps.tickOptions ?? {});
+  // The agent resolver lives on `deps` because the repo CLI handlers
+  // also need it for override validation, but `tick_once` reads it off
+  // `TickOptions`. We merge it in here so a deployment's `[agents]`
+  // block is honoured without `index.ts` having to know about
+  // `TickOptions`.
+  const tickOptions: TickOptions = {
+    ...(deps.tickOptions ?? {}),
+    agentResolver: deps.agentResolver,
+  };
+  const results = await tick_once(tickDeps, tickOptions);
   for (const r of results) {
     io.stdout(`${JSON.stringify(r)}\n`);
   }
@@ -597,10 +614,10 @@ function handleRepo(
   switch (sub) {
     case "add":
       if (wantsHelp(rest)) return printHelp(io, ["repo", "add"]);
-      return handleRepoAdd(rest, service, io);
+      return handleRepoAdd(rest, service, deps.agentResolver, io);
     case "update":
       if (wantsHelp(rest)) return printHelp(io, ["repo", "update"]);
-      return handleRepoUpdate(rest, service, io);
+      return handleRepoUpdate(rest, service, deps.agentResolver, io);
     case "remove": {
       if (wantsHelp(rest)) return printHelp(io, ["repo", "remove"]);
       const repoId = positional(rest);
@@ -653,16 +670,59 @@ const REPO_FLAGS: Array<{ flag: string; key: string }> = [
   { flag: "--test-cmd", key: "test_cmd" },
   { flag: "--ci-workflow-name", key: "ci_workflow_name" },
   { flag: "--contribution-guide-path", key: "contribution_guide_path" },
+  { flag: "--agent-worker", key: "agent_worker" },
+  { flag: "--agent-reviewer", key: "agent_reviewer" },
 ];
+
+// On `repo update`, an empty string for an agent override means "clear
+// it" — fall back to the deployment default. We translate that here
+// rather than burdening every call site, and only on update (add does
+// not accept clearing a field that was never set).
+function normalizeAgentClearing(
+  patch: Record<string, string>,
+): Record<string, string | null> {
+  const out: Record<string, string | null> = { ...patch };
+  for (const key of ["agent_worker", "agent_reviewer"] as const) {
+    if (out[key] === "") out[key] = null;
+  }
+  return out;
+}
+
+function validateAgentOverrides(
+  input: { agent_worker?: string | null; agent_reviewer?: string | null },
+  resolver: AgentResolver,
+  io: CliIO,
+): DispatchResult | null {
+  const registered = new Set(resolver.registeredAgents());
+  for (const key of ["agent_worker", "agent_reviewer"] as const) {
+    const v = input[key];
+    if (typeof v === "string" && !registered.has(v)) {
+      return writeError(
+        io,
+        "usage_error",
+        `${key.replace("_", "-")}: agent "${v}" is not registered in [agents.invocations]; known: ${[...registered].sort().join(", ")}`,
+        { agent: v, registered: [...registered].sort() },
+      );
+    }
+  }
+  return null;
+}
 
 function handleRepoAdd(
   argv: string[],
   service: RepoService,
+  resolver: AgentResolver,
   io: CliIO,
 ): DispatchResult {
   const json = tryParseJsonFlag(argv);
   if (!json.ok) return writeError(io, "usage_error", json.message);
   const input = json.value !== undefined ? json.value : flagsToObject(argv, REPO_FLAGS);
+  const overrideErr = validateAgentOverrides(
+    input as { agent_worker?: string; agent_reviewer?: string },
+    resolver,
+    io,
+  );
+  if (overrideErr !== null) return overrideErr;
   const row = service.add(input);
   io.stdout(`${JSON.stringify(row)}\n`);
   return { exitCode: 0 };
@@ -671,6 +731,7 @@ function handleRepoAdd(
 function handleRepoUpdate(
   argv: string[],
   service: RepoService,
+  resolver: AgentResolver,
   io: CliIO,
 ): DispatchResult {
   const repoId = readFlag(argv, "--id") ?? positional(argv);
@@ -679,13 +740,24 @@ function handleRepoUpdate(
   }
   const json = tryParseJsonFlag(argv);
   if (!json.ok) return writeError(io, "usage_error", json.message);
+  // `--agent-worker ""` on the flag form means "clear the override and
+  // fall back to the deployment default". JSON callers express the
+  // same with an explicit `null` and don't go through the empty-string
+  // shim. Validation runs after the rewrite so it never rejects "".
   const patch = json.value !== undefined
-    ? json.value
-    : flagsToObject(
-        argv,
-        // --id is the row selector, not a column to update.
-        REPO_FLAGS.filter((f) => f.flag !== "--id"),
-      );
+    ? (json.value as Record<string, unknown>)
+    : (normalizeAgentClearing(
+        flagsToObject(
+          argv,
+          REPO_FLAGS.filter((f) => f.flag !== "--id"),
+        ),
+      ) as Record<string, unknown>);
+  const overrideErr = validateAgentOverrides(
+    patch as { agent_worker?: string | null; agent_reviewer?: string | null },
+    resolver,
+    io,
+  );
+  if (overrideErr !== null) return overrideErr;
   const row = service.update(repoId, patch);
   io.stdout(`${JSON.stringify(row)}\n`);
   return { exitCode: 0 };

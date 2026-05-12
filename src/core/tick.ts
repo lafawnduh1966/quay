@@ -10,6 +10,13 @@ import type { LinearPort } from "../ports/linear.ts";
 import type { SlackPort } from "../ports/slack.ts";
 import type { PaneExitInfo, TmuxPort } from "../ports/tmux.ts";
 import { probeAgentIdentity } from "./agent_identity.ts";
+import {
+  DEFAULT_AGENT_NAME,
+  DEFAULT_CLAUDE_WORKER_INVOCATION,
+  type AgentResolver,
+  type AgentRole,
+  type ResolvedAgent,
+} from "./agents.ts";
 import { runCancelFinalizer } from "./cancel.ts";
 import { EXIT_INFO_NONE } from "./exit_status.ts";
 import {
@@ -43,6 +50,11 @@ export const DEFAULT_MAX_SPAWN_FAILURES = 3;
 export const DEFAULT_CLAIM_TIMEOUT_SECONDS = 1800;
 export const DEFAULT_MAX_CLAIM_EXPIRATIONS = 3;
 export const DEFAULT_MAX_NON_BUDGET_RESPAWNS = 20;
+// Canonical claude worker template, kept here as a named re-export so
+// callers that imported it from `tick.ts` before the agent-resolver
+// refactor (and tests that still pass `agentInvocation: "..."` as a
+// shorthand) don't have to chase the rename.
+//
 // `--output-format json` makes claude print one final JSON envelope
 // (tokens, cost, model id, full response) to stdout instead of the
 // streaming human-readable text. We redirect that stdout to
@@ -52,16 +64,14 @@ export const DEFAULT_MAX_NON_BUDGET_RESPAWNS = 20;
 // `--debug --debug-file .quay-tool-trace.log` captures claude's
 // tool-dispatch / API events into a worktree-local file, ingested
 // as a `tool_trace` artifact. This is the highest-signal data for
-// prompt iteration ("preamble v2 made claude read 3 files, v1 made
-// it read 12"); without it, only the final stdout reaches the
+// prompt iteration; without it, only the final stdout reaches the
 // session log and intermediate tool calls vanish.
 //
 // Operators with non-claude agent runtimes (Codex, Cursor, ...)
-// override this template and write the same filenames for capture
-// to land — quay reads `.quay-usage.json` and `.quay-tool-trace.log`
-// by name, not by runtime.
-export const DEFAULT_AGENT_INVOCATION =
-  "claude --permission-mode bypassPermissions --output-format json --debug --debug-file .quay-tool-trace.log < {prompt_file} > .quay-usage.json";
+// register their own entry under `[agents.invocations]` and either
+// emit the same `.quay-usage.json` / `.quay-tool-trace.log` files for
+// capture, or accept null cost / no trace for those attempts.
+export const DEFAULT_AGENT_INVOCATION = DEFAULT_CLAUDE_WORKER_INVOCATION;
 
 export interface TickDeps {
   db: DB;
@@ -86,6 +96,14 @@ export interface TickOptions {
   // ingest matches the right author when tick and worker authenticate as
   // different identities. Defaults to whatever `gh api user` reports.
   reviewerLogin?: string;
+  // Either `agentResolver` (production: looks up the registered agent
+  // for a given (repo_id, role)) or `agentInvocation` (test shorthand:
+  // same string for every attempt). When both are set, the resolver
+  // wins. When neither is set, every attempt runs the built-in claude
+  // default. `agentInvocation` is kept around so tests that just want
+  // "run `bun --version` as the worker" don't have to construct a
+  // resolver and a fake DB row.
+  agentResolver?: AgentResolver;
   agentInvocation?: string;
   maxAttemptDurationSeconds?: number;
   stalenessThresholdSeconds?: number;
@@ -231,7 +249,7 @@ export async function tick_once(
   options: TickOptions = {},
 ): Promise<TickTaskResult[]> {
   const max = options.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
-  const agentInvocation = options.agentInvocation ?? DEFAULT_AGENT_INVOCATION;
+  const agentResolver = resolveTickAgentResolver(options);
   // Linear writebacks are scheduled inside the lock but drained after it
   // releases, so a slow or unreachable Linear cannot extend the supervisor-
   // lock-held window and starve concurrent ticks / cancels.
@@ -362,7 +380,7 @@ export async function tick_once(
           continue;
         }
         try {
-          results.push(promoteAndSpawnReviewer(deps, task, agentInvocation, options));
+          results.push(promoteAndSpawnReviewer(deps, task, agentResolver, options));
         } catch (err) {
           results.push(recordTickError(deps, task.task_id, err));
         }
@@ -377,7 +395,7 @@ export async function tick_once(
         continue;
       }
       try {
-        results.push(promoteAndSpawn(deps, task, agentInvocation, linearSyncs));
+        results.push(promoteAndSpawn(deps, task, agentResolver, linearSyncs));
       } catch (err) {
         results.push(recordTickError(deps, task.task_id, err));
       }
@@ -2292,9 +2310,13 @@ function loadFinalPrompt(db: DB, taskId: string, attemptId: number): string {
 function promoteAndSpawn(
   deps: TickDeps,
   task: QueuedTaskRow,
-  agentInvocation: string,
+  agentResolver: AgentResolver,
   linearSyncs: LinearSyncQueue,
 ): TickTaskResult {
+  const { agent: agentName, invocation: agentInvocation } = agentResolver.resolve(
+    task.repo_id,
+    "worker",
+  );
   if (task.cancel_requested_at !== null) {
     return { task_id: task.task_id, action: "skipped_predicate" };
   }
@@ -2383,10 +2405,10 @@ function promoteAndSpawn(
   deps.db
     .query(
       `UPDATE attempts
-          SET tmux_session = ?, agent_identity = ?
+          SET tmux_session = ?, agent_identity = ?, agent_name = ?
         WHERE attempt_id = ?`,
     )
-    .run(sessionName, agentIdentity, pending.attempt_id);
+    .run(sessionName, agentIdentity, agentName, pending.attempt_id);
   deps.db
     .query(`UPDATE tasks SET spawn_failures_consecutive = 0 WHERE task_id = ?`)
     .run(task.task_id);
@@ -2399,9 +2421,13 @@ function promoteAndSpawn(
 function promoteAndSpawnReviewer(
   deps: TickDeps,
   task: ReviewAttemptTaskRow,
-  agentInvocation: string,
+  agentResolver: AgentResolver,
   options: TickOptions,
 ): TickTaskResult {
+  const { agent: agentName, invocation: agentInvocation } = agentResolver.resolve(
+    task.repo_id,
+    "reviewer",
+  );
   if (task.cancel_requested_at !== null) {
     return { task_id: task.task_id, action: "skipped_predicate" };
   }
@@ -2490,12 +2516,30 @@ function promoteAndSpawnReviewer(
   deps.db
     .query(
       `UPDATE attempts
-          SET tmux_session = ?, agent_identity = ?
+          SET tmux_session = ?, agent_identity = ?, agent_name = ?
         WHERE attempt_id = ?`,
     )
-    .run(sessionName, agentIdentity, task.attempt_id);
+    .run(sessionName, agentIdentity, agentName, task.attempt_id);
 
   return { task_id: task.task_id, action: "spawned" };
+}
+
+// Bridge between the test-friendly `agentInvocation` shorthand and the
+// production `agentResolver`. When the caller supplies a full resolver
+// we use it directly; otherwise we wrap the single invocation string
+// (test default, or the legacy `agent_invocation =` config key) in a
+// trivial resolver that ignores repo and role. The wrapped resolver
+// reports the registered agent name as "claude" because the legacy key
+// is documented as the claude template — the schema migration treats
+// it as `[agents.invocations.claude]`.
+function resolveTickAgentResolver(options: TickOptions): AgentResolver {
+  if (options.agentResolver !== undefined) return options.agentResolver;
+  const invocation = options.agentInvocation ?? DEFAULT_CLAUDE_WORKER_INVOCATION;
+  const resolved: ResolvedAgent = { agent: DEFAULT_AGENT_NAME, invocation };
+  return {
+    resolve: (_repoId: string, _role: AgentRole) => resolved,
+    registeredAgents: () => [DEFAULT_AGENT_NAME],
+  };
 }
 
 function recordTickError(deps: TickDeps, taskId: string, err: unknown): TickTaskResult {

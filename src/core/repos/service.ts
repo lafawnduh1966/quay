@@ -20,6 +20,8 @@ export interface RepoRow {
   test_cmd: string | null;
   ci_workflow_name: string | null;
   contribution_guide_path: string | null;
+  agent_worker: string | null;
+  agent_reviewer: string | null;
   archived_at: string | null;
   created_at: string;
 }
@@ -51,6 +53,7 @@ export interface RepoService {
 const SELECT_REPO_COLUMNS = `
   repo_id, repo_url, base_branch, package_manager, install_cmd,
   test_cmd, ci_workflow_name, contribution_guide_path,
+  agent_worker, agent_reviewer,
   archived_at, created_at
 `;
 
@@ -94,6 +97,7 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
         `UPDATE repos
            SET repo_url = ?, base_branch = ?, package_manager = ?, install_cmd = ?,
                test_cmd = ?, ci_workflow_name = ?, contribution_guide_path = ?,
+               agent_worker = ?, agent_reviewer = ?,
                archived_at = NULL
          WHERE repo_id = ?`,
       ).run(
@@ -104,14 +108,17 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
         parsed.test_cmd ?? null,
         parsed.ci_workflow_name ?? null,
         parsed.contribution_guide_path ?? null,
+        parsed.agent_worker ?? null,
+        parsed.agent_reviewer ?? null,
         parsed.repo_id,
       );
     } else {
       db.query(
         `INSERT INTO repos (
            repo_id, repo_url, base_branch, package_manager, install_cmd,
-           test_cmd, ci_workflow_name, contribution_guide_path, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+           test_cmd, ci_workflow_name, contribution_guide_path,
+           agent_worker, agent_reviewer, created_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         parsed.repo_id,
         parsed.repo_url,
@@ -121,6 +128,8 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
         parsed.test_cmd ?? null,
         parsed.ci_workflow_name ?? null,
         parsed.contribution_guide_path ?? null,
+        parsed.agent_worker ?? null,
+        parsed.agent_reviewer ?? null,
         clock.nowISO(),
       );
     }
@@ -212,11 +221,20 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
       parsed.created_at !== undefined
         ? parsed.created_at
         : (existing?.created_at ?? clock.nowISO());
+    const agentWorker =
+      parsed.agent_worker !== undefined
+        ? parsed.agent_worker
+        : (existing?.agent_worker ?? null);
+    const agentReviewer =
+      parsed.agent_reviewer !== undefined
+        ? parsed.agent_reviewer
+        : (existing?.agent_reviewer ?? null);
     if (existing) {
       db.query(
         `UPDATE repos
            SET repo_url = ?, base_branch = ?, package_manager = ?, install_cmd = ?,
                test_cmd = ?, ci_workflow_name = ?, contribution_guide_path = ?,
+               agent_worker = ?, agent_reviewer = ?,
                archived_at = ?, created_at = ?
          WHERE repo_id = ?`,
       ).run(
@@ -227,6 +245,8 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
         parsed.test_cmd ?? null,
         parsed.ci_workflow_name ?? null,
         parsed.contribution_guide_path ?? null,
+        agentWorker,
+        agentReviewer,
         archivedAt,
         createdAt,
         parsed.repo_id,
@@ -236,8 +256,9 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
         `INSERT INTO repos (
            repo_id, repo_url, base_branch, package_manager, install_cmd,
            test_cmd, ci_workflow_name, contribution_guide_path,
+           agent_worker, agent_reviewer,
            archived_at, created_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       ).run(
         parsed.repo_id,
         parsed.repo_url,
@@ -247,6 +268,8 @@ export function createRepoService({ db, clock }: RepoServiceDeps): RepoService {
         parsed.test_cmd ?? null,
         parsed.ci_workflow_name ?? null,
         parsed.contribution_guide_path ?? null,
+        agentWorker,
+        agentReviewer,
         archivedAt,
         createdAt,
       );

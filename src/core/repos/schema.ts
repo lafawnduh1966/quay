@@ -17,6 +17,16 @@ export const repoIdSchema = z
       "repo_id must match [A-Za-z0-9._-]+ and cannot be '.' or '..' (no path separators or traversal)",
   });
 
+// `agent_worker` / `agent_reviewer` name an entry registered under
+// `[agents.invocations]` in deployment config. NULL means "follow the
+// deployment default for this role". We do not validate the name
+// matches a registered agent here — the repo service does not see the
+// config — so the CLI handler validates against the resolver's
+// `registeredAgents()` before calling into the service.
+const agentName = z.string().min(1).max(64).regex(/^[A-Za-z0-9._-]+$/, {
+  message: "agent name must match [A-Za-z0-9._-]+",
+});
+
 export const repoAddInputSchema = z
   .object({
     repo_id: repoIdSchema,
@@ -27,6 +37,8 @@ export const repoAddInputSchema = z
     test_cmd: nonEmptyString.optional(),
     ci_workflow_name: nonEmptyString.optional(),
     contribution_guide_path: nonEmptyString.optional(),
+    agent_worker: agentName.optional(),
+    agent_reviewer: agentName.optional(),
   })
   .strict();
 
@@ -41,6 +53,8 @@ export const repoUpdateInputSchema = z
     test_cmd: nonEmptyString.nullable().optional(),
     ci_workflow_name: nonEmptyString.nullable().optional(),
     contribution_guide_path: nonEmptyString.nullable().optional(),
+    agent_worker: agentName.nullable().optional(),
+    agent_reviewer: agentName.nullable().optional(),
   })
   .strict();
 
@@ -61,6 +75,8 @@ export const repoImportInputSchema = z
     test_cmd: nonEmptyString.nullable().optional(),
     ci_workflow_name: nonEmptyString.nullable().optional(),
     contribution_guide_path: nonEmptyString.nullable().optional(),
+    agent_worker: agentName.nullable().optional(),
+    agent_reviewer: agentName.nullable().optional(),
     archived_at: z.string().nullable().optional(),
     created_at: nonEmptyString.optional(),
   })

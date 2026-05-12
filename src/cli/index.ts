@@ -41,6 +41,7 @@ import { createLazyRepoVocabLookup } from "./repo_vocab_lookup.ts";
 import { handleValidateTicket } from "./validate_ticket.ts";
 import { createRepoService } from "../core/repos/service.ts";
 import { createTagService } from "../core/tags/service.ts";
+import { createAgentResolver } from "../core/agents.ts";
 
 async function main(): Promise<number> {
   const argv = process.argv.slice(2);
@@ -143,6 +144,7 @@ async function main(): Promise<number> {
     clock,
   });
   const repoService = createRepoService({ db, clock });
+  const agentResolver = createAgentResolver({ db, config });
 
   const deps: CliDeps = {
     db,
@@ -184,6 +186,7 @@ async function main(): Promise<number> {
     adaptersConfig,
     repoService,
     tagService: createTagService({ db, clock, repoService }),
+    agentResolver,
   };
 
   const io = {

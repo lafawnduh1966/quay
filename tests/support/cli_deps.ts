@@ -7,6 +7,7 @@ import { InProcessSupervisorLock } from "../../src/core/supervisor_lock.ts";
 import type { ValidatorRunner } from "../../src/core/validator_runner.ts";
 import { createRepoService } from "../../src/core/repos/service.ts";
 import { createTagService } from "../../src/core/tags/service.ts";
+import { createAgentResolver } from "../../src/core/agents.ts";
 import type { Harness } from "./harness.ts";
 import { FakeCommandRunner } from "./fakes/command_runner.ts";
 import { FakeGit } from "./fakes/git.ts";
@@ -85,6 +86,7 @@ export function buildCliDeps(
         clock: h.clock,
         repoService,
       }),
+      agentResolver: createAgentResolver({ db: h.db, config: {} }),
     },
     git,
     github,

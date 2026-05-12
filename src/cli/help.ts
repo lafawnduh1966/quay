@@ -151,6 +151,14 @@ const COMMANDS: Record<string, CommandSpec> = {
       { flag: "--test-cmd <cmd>", desc: "Optional test command." },
       { flag: "--ci-workflow-name <name>", desc: "Optional CI workflow name." },
       { flag: "--contribution-guide-path <path>", desc: "Optional CONTRIBUTING path." },
+      {
+        flag: "--agent-worker <name>",
+        desc: "Optional. Pin worker attempts to an agent registered under [agents.invocations]. Defaults to [agents].worker.",
+      },
+      {
+        flag: "--agent-reviewer <name>",
+        desc: "Optional. Pin reviewer attempts to an agent registered under [agents.invocations]. Defaults to [agents].reviewer.",
+      },
       { flag: "--input <json>", desc: "Alternative: pass the full row as JSON." },
     ],
   },
@@ -160,6 +168,14 @@ const COMMANDS: Record<string, CommandSpec> = {
     summary: "Update mutable fields on an existing repo row.",
     flags: [
       { flag: "--id <id>", desc: "Selector (alternative to positional <repo_id>)." },
+      {
+        flag: "--agent-worker <name>",
+        desc: "Pin worker attempts to a registered agent. Pass '' to clear and fall back to the deployment default.",
+      },
+      {
+        flag: "--agent-reviewer <name>",
+        desc: "Pin reviewer attempts to a registered agent. Pass '' to clear and fall back to the deployment default.",
+      },
       { flag: "--input <json>", desc: "Alternative: pass the patch as JSON." },
     ],
   },
