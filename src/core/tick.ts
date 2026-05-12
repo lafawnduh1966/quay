@@ -678,16 +678,13 @@ function processRunningReviewAttempt(
     } catch (err) {
       blocker = `Unable to read reviewer blocker file: ${(err as Error).message}`;
     }
-    deps.artifactStore.writeArtifact({
-      taskId: task.task_id,
-      attemptId: task.attempt_id,
-      kind: "review_blocker",
-      content: blocker,
-      extension: "md",
-    });
     try {
       rmSync(blockerPath, { force: true });
     } catch {}
+    // markReviewInfraFailure persists the blocker as a review_blocker
+    // artifact inside its txn. A second write here would collide on the
+    // (task_id, attempt_id, kind, content_hash) unique index and roll
+    // the whole transition back, leaving the task stuck on tick_error.
     return markReviewInfraFailure(deps, task, blocker, exitInfo, options);
   }
 

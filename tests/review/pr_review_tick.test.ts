@@ -1,4 +1,5 @@
-import { mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, expect, test } from "bun:test";
 import { tick_once } from "../../src/core/tick.ts";
 import { createArtifactStore } from "../../src/artifacts/store.ts";
@@ -376,6 +377,72 @@ test("reviewer infrastructure failures retry twice then park at same SHA", async
     )
     .get(taskId);
   expect(pending?.n).toBe(0);
+});
+
+test("dead reviewer leaving .quay-blocked.md retries once and records a single review_blocker artifact", async () => {
+  h = createHarness();
+  const built = buildTickDeps(h);
+  const repoId = insertRepo(h.db, "repo-review-blocker");
+  const taskId = "pr-review-repo-review-blocker-12";
+  const worktreePath = `${h.dataDir}/worktrees/review-12`;
+  mkdirSync(worktreePath, { recursive: true });
+  const blockerContent =
+    "Reviewer cannot post a verdict: spec is ambiguous on retry semantics.";
+  writeFileSync(join(worktreePath, ".quay-blocked.md"), blockerContent);
+  h.db
+    .query(
+      `INSERT INTO tasks (
+         task_id, repo_id, state, branch_name, tmux_id, worktree_path,
+         pr_number, head_sha, retry_budget, created_at, updated_at
+       ) VALUES (?, ?, 'pr-review', 'quay-review/12', 'quay-review-repo-review-blocker-12',
+                 ?, 12, 'sha-12', 1, ?, ?)`,
+    )
+    .run(taskId, repoId, worktreePath, h.clock.nowISO(), h.clock.nowISO());
+  const attemptId = insertAttempt(h.db, {
+    taskId,
+    reason: "review_only",
+    consumedBudget: 0,
+    spawnedAt: h.clock.nowISO(),
+  });
+  h.db
+    .query(
+      `UPDATE attempts
+          SET head_sha = 'sha-12', tmux_session = 'quay-review-session-12'
+        WHERE attempt_id = ?`,
+    )
+    .run(attemptId);
+  // Reviewer tmux is dead: deliberately not added to FakeTmux.liveSessions.
+
+  const results = await tick_once(built.deps, { reviewerEnabled: true });
+
+  expect(results).toContainEqual({
+    task_id: taskId,
+    action: "review_retry_scheduled",
+  });
+  expect(existsSync(join(worktreePath, ".quay-blocked.md"))).toBe(false);
+
+  const blockerArtifacts = h.db
+    .query<{ kind: string; file_path: string }, [string, number]>(
+      `SELECT kind, file_path FROM artifacts
+        WHERE task_id = ? AND attempt_id = ? AND kind = 'review_blocker'`,
+    )
+    .all(taskId, attemptId);
+  expect(blockerArtifacts).toHaveLength(1);
+
+  const tickErrors = h.db
+    .query<{ n: number }, [string]>(
+      `SELECT COUNT(*) AS n FROM events
+        WHERE task_id = ? AND event_type = 'tick_error'`,
+    )
+    .get(taskId);
+  expect(tickErrors?.n).toBe(0);
+
+  const task = h.db
+    .query<{ state: string; tick_error: string | null }, [string]>(
+      `SELECT state, tick_error FROM tasks WHERE task_id = ?`,
+    )
+    .get(taskId);
+  expect(task).toEqual({ state: "pr-review", tick_error: null });
 });
 
 test("tick reaps a superseded reviewer whose tmux outlived enterReview's commit", async () => {
