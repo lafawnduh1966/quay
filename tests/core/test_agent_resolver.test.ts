@@ -7,6 +7,7 @@ import { afterEach, expect, test } from "bun:test";
 import {
   buildAgentSelection,
   createAgentResolver,
+  validateAgentSelection,
   DEFAULT_AGENT_NAME,
   DEFAULT_CLAUDE_REVIEWER_INVOCATION,
   DEFAULT_CLAUDE_WORKER_INVOCATION,
@@ -132,6 +133,44 @@ test("resolver throws when the repo override names an unregistered agent", () =>
   expect(() => resolver.resolve("repo-orphan", "worker")).toThrow(
     /removed-runtime/,
   );
+});
+
+test("createAgentResolver fails at boot when [agents].worker names an unregistered entry", () => {
+  h = createHarness();
+  // Worker default points at "codex" but no [agents.invocations.codex]
+  // block was registered. Without the eager check this would only blow
+  // up when the first queued task tried to spawn; with it, the
+  // production CLI fails the moment config is loaded.
+  expect(() =>
+    createAgentResolver({
+      db: h.db,
+      config: {
+        agents: {
+          worker: "codex",
+          invocations: {
+            claude: { worker: "claude --w", reviewer: "claude --r" },
+          },
+        },
+      },
+    }),
+  ).toThrow(/codex/);
+});
+
+test("validateAgentSelection flags a registered entry that's missing the chosen role", () => {
+  // Defaults say "use codex for the reviewer," but the codex entry
+  // only set `worker = ...`. Same boot-time failure shape.
+  expect(() =>
+    validateAgentSelection({
+      defaults: { worker: "claude", reviewer: "codex" },
+      invocations: {
+        claude: {
+          worker: DEFAULT_CLAUDE_WORKER_INVOCATION,
+          reviewer: DEFAULT_CLAUDE_REVIEWER_INVOCATION,
+        },
+        codex: { worker: "codex --w" },
+      },
+    }),
+  ).toThrow(/reviewer/);
 });
 
 test("registeredAgents lists every entry under [agents.invocations] plus the seeded claude", () => {

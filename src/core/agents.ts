@@ -98,8 +98,33 @@ export function buildAgentSelection(config: QuayConfig): AgentSelection {
   return { defaults, invocations };
 }
 
+// Catches operator typos at boot rather than at first-spawn time. A
+// config that says `[agents].worker = "codex"` but never registers a
+// `[agents.invocations.codex]` block (or registers one without a
+// `worker = ...` line) is a config mistake, not a runtime condition.
+// Surfacing it during `createAgentResolver` means the production CLI
+// startup fails loudly the moment the config is loaded — same shape
+// as the schema rejection in `loadConfig` for typo'd top-level keys.
+export function validateAgentSelection(selection: AgentSelection): void {
+  for (const role of ["worker", "reviewer"] as const) {
+    const name = selection.defaults[role];
+    const entry = selection.invocations[name];
+    if (entry === undefined) {
+      throw new Error(
+        `[agents].${role} = "${name}" but no [agents.invocations.${name}] is registered`,
+      );
+    }
+    if (entry[role] === undefined) {
+      throw new Error(
+        `[agents].${role} = "${name}" but [agents.invocations.${name}].${role} is not set`,
+      );
+    }
+  }
+}
+
 export function createAgentResolver(deps: AgentResolverDeps): AgentResolver {
   const selection = buildAgentSelection(deps.config);
+  validateAgentSelection(selection);
 
   function lookupOverride(repoId: string): RepoOverrideRow | null {
     return (
