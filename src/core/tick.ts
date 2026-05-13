@@ -194,6 +194,14 @@ interface PrOpenTaskRow {
   last_conflict_observation: string | null;
 }
 
+interface PrReviewTaskRow {
+  task_id: string;
+  repo_id: string;
+  branch_name: string;
+  worktree_path: string;
+  cancel_requested_at: string | null;
+}
+
 interface ReviewAttemptTaskRow {
   task_id: string;
   repo_id: string;
@@ -369,7 +377,29 @@ export async function tick_once(
       // no-op.
       reapAbandonedReviewers(deps);
 
+      // Mirror the precedent in processPrOpenTask / processDoneTask: poll PR
+      // state once per pr-review task before iterating review attempts. A
+      // merge / close by a human (or any external actor) while we're in
+      // pr-review must short-circuit to the terminal state instead of
+      // respawning a reviewer pane onto an already-closed PR.
+      const prReviewSnapshot = readPrReview(deps.db).filter(
+        (t) => !cancelledIds.has(t.task_id),
+      );
+      const terminalReviewIds = new Set<string>();
+      for (const task of prReviewSnapshot) {
+        try {
+          const result = processPrReviewTerminal(deps, task);
+          if (result !== null) {
+            results.push(result);
+            terminalReviewIds.add(task.task_id);
+          }
+        } catch (err) {
+          results.push(recordTickError(deps, task.task_id, err));
+        }
+      }
+
       for (const task of runningReviewSnapshot) {
+        if (terminalReviewIds.has(task.task_id)) continue;
         try {
           const result = processRunningReviewAttempt(deps, task, options);
           if (result !== null) results.push(result);
@@ -382,6 +412,7 @@ export async function tick_once(
         options.maxConcurrentReviewers ?? DEFAULT_MAX_CONCURRENT_REVIEWERS;
       let reviewerRunningCount = countRunningReviewers(deps.db);
       for (const task of pendingReviewSnapshot) {
+        if (terminalReviewIds.has(task.task_id)) continue;
         if (reviewerRunningCount >= reviewCap) {
           results.push({ task_id: task.task_id, action: "skipped_capacity" });
           continue;
@@ -510,6 +541,18 @@ function readDone(db: DB): DoneTaskRow[] {
               last_conflict_observation
          FROM tasks
         WHERE state = 'done'
+        ORDER BY created_at, task_id`,
+    )
+    .all();
+}
+
+function readPrReview(db: DB): PrReviewTaskRow[] {
+  return db
+    .query<PrReviewTaskRow, []>(
+      `SELECT task_id, repo_id, branch_name, worktree_path,
+              cancel_requested_at
+         FROM tasks
+        WHERE state = 'pr-review'
         ORDER BY created_at, task_id`,
     )
     .all();
@@ -949,12 +992,32 @@ interface PrTerminalRow {
   worktree_path: string;
 }
 
+function processPrReviewTerminal(
+  deps: TickDeps,
+  task: PrReviewTaskRow,
+): TickTaskResult | null {
+  if (task.cancel_requested_at !== null) return null;
+  const attempt = loadLatestAttempt(deps.db, task.task_id);
+  if (!attempt) return null;
+
+  // Unlike pr-open / done — which require a snapshot to decide everything —
+  // pr-review only consults the snapshot for terminal short-circuit. A
+  // missing snapshot must not block the review-attempt iteration; fall
+  // through and let the next tick re-probe.
+  const snapshot = deps.github.prSnapshot(task.repo_id, task.branch_name);
+  if (snapshot === null) return null;
+  if (snapshot.state !== "merged" && snapshot.state !== "closed_unmerged") {
+    return null;
+  }
+  return finalizePrTerminal(deps, task, attempt, snapshot.state, "pr-review");
+}
+
 function finalizePrTerminal(
   deps: TickDeps,
   task: PrTerminalRow,
   attempt: CurrentAttemptRow,
   terminal: "merged" | "closed_unmerged",
-  fromState: "pr-open" | "done",
+  fromState: "pr-open" | "done" | "pr-review",
 ): TickTaskResult {
   const now = deps.clock.nowISO();
 
@@ -962,6 +1025,7 @@ function finalizePrTerminal(
   applyTerminalCleanup(deps, task, terminal);
 
   // Step 2: atomic SQL terminal transition.
+  const reviewerSessionsToKill: string[] = [];
   deps.db.exec("BEGIN IMMEDIATE");
   try {
     const upd = deps.db
@@ -977,12 +1041,44 @@ function finalizePrTerminal(
       deps.db.exec("ROLLBACK");
       return { task_id: task.task_id, action: "skipped_predicate" };
     }
-    // Stamp `pr_merged` / `pr_closed_unmerged` exit_kind on the latest attempt
-    // when it has no terminal exit yet (e.g. CI was still pending — the
-    // attempt itself didn't reach a clean done state, so the latest exit_kind
-    // is whatever was set when the worker died, typically `pr_opened`).
-    // We only update when ended_at IS NULL to preserve the historical exit.
-    if (attempt.spawned_at !== null) {
+    if (fromState === "pr-review") {
+      // Mark every active review-only attempt ended + superseded so the
+      // reviewer pane stops being a live participant in the task's history,
+      // and collect their tmux sessions for a post-commit kill. Mirrors
+      // enterReview's supersede-on-new-SHA pattern. reapAbandonedReviewers
+      // closes the crash window between this COMMIT and the kill loop.
+      const activeReviewers = deps.db
+        .query<{ tmux_session: string | null }, [string]>(
+          `SELECT tmux_session
+             FROM attempts
+            WHERE task_id = ?
+              AND reason = 'review_only'
+              AND ended_at IS NULL`,
+        )
+        .all(task.task_id);
+      for (const row of activeReviewers) {
+        if (row.tmux_session !== null) {
+          reviewerSessionsToKill.push(row.tmux_session);
+        }
+      }
+      deps.db
+        .query(
+          `UPDATE attempts
+              SET ended_at = ?,
+                  review_verdict = 'superseded',
+                  kill_intent = COALESCE(kill_intent, 'superseded')
+            WHERE task_id = ?
+              AND reason = 'review_only'
+              AND ended_at IS NULL`,
+        )
+        .run(now, task.task_id);
+    } else if (attempt.spawned_at !== null) {
+      // Stamp `pr_merged` / `pr_closed_unmerged` exit_kind on the latest
+      // attempt when it has no terminal exit yet (e.g. CI was still pending
+      // — the attempt itself didn't reach a clean done state, so the latest
+      // exit_kind is whatever was set when the worker died, typically
+      // `pr_opened`). We only update when ended_at IS NULL to preserve the
+      // historical exit.
       deps.db
         .query(
           `UPDATE attempts SET ended_at = ? WHERE attempt_id = ? AND ended_at IS NULL`,
@@ -1003,6 +1099,12 @@ function finalizePrTerminal(
       deps.db.exec("ROLLBACK");
     } catch {}
     throw err;
+  }
+
+  for (const session of reviewerSessionsToKill) {
+    try {
+      deps.tmux.kill(session);
+    } catch {}
   }
 
   return {
