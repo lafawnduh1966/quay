@@ -93,11 +93,17 @@ bot account); leaving it unset in that setup will silently never match the
 posted review and park the task in `non_budget_loop` after the infra-failure
 retry budget runs out.
 
-Both bare slugs (`my-reviewer-bot`) and `app/`-prefixed slugs
-(`app/my-reviewer-bot`) are accepted: tick strips the `app/` prefix on both
-the configured login and the review's `author.login` before comparing, because
-`gh pr view --json reviews` returns App-bot review authors as the bare slug
-while `gh pr view --json author` and the GitHub UI show the `app/` form.
+Both regular user accounts and GitHub App identities are supported. Use the
+form that matches the reviewer's actual GitHub identity:
+
+- `login = "<slug>"` (bare) for a regular user account.
+- `login = "app/<slug>"` for a GitHub App identity (e.g. an installation
+  token used by a bot account).
+
+Tick distinguishes the two via the review author's account type as reported
+by the GitHub API (`user.type` of `Bot` for App authors, `User` for regular
+accounts) — not just the login string. This means a same-named regular user
+*cannot* satisfy a gate configured against `app/<slug>`, and vice versa.
 
 `gh_token_file` makes the reviewer tmux pane authenticate to GitHub as a
 different identity than the worker that opened the PR. GitHub refuses

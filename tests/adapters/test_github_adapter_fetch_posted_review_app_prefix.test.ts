@@ -1,13 +1,16 @@
-// Regression: when a posted review's `author.login` comes back from
-// `gh pr view --json reviews` without the `app/` prefix (the form
-// the gh CLI returns for App-bot authors), `fetchPostedReview` must
-// still match an operator-configured `expectedLogin` that *includes*
-// the `app/` prefix — the form `gh pr view --json author`, the GitHub
-// UI, and the natural reading of the bot identity all expose.
+// Identity-preserving review-author matching.
 //
-// Symmetric case: a configured bare-slug `expectedLogin` matches a
-// review whose author.login carries the prefix. Future-proofs against
-// any reversal of the gh CLI's prefix behavior on either field.
+// `fetchPostedReview` gates the pr-review -> done transition, so it must
+// distinguish a GitHub App identity (`reviewer.login = "app/<slug>"`) from
+// a regular user account that happens to share the slug. The previous
+// `gh pr view --json reviews` projection collapsed both into the same
+// `author.login` string ("<slug>", with the `[bot]` suffix stripped),
+// which means a same-named user could satisfy a gate intended for the
+// App.
+//
+// The adapter now reads the REST reviews endpoint and matches on
+// `user.type` (`Bot` for App, `User` for regular) in addition to
+// `user.login` (with `[bot]` stripped on the Bot side only).
 import {
   chmodSync,
   mkdirSync,
@@ -56,20 +59,23 @@ function makeBareDir(): { reposRoot: string; repoId: string } {
   return { reposRoot, repoId };
 }
 
-// gh stub: `pr view <n> --json reviews` returns a single APPROVED review
-// authored by the bare-slug form `<slug>`; graphql inline-comments call
-// returns an empty list. Any other invocation is fatal so the test fails
-// loudly if the adapter probes anything unexpected (e.g. `gh api user`,
-// which would defeat the point — `expectedLogin` must be honored).
-const STUB_BARE_AUTHOR_APPROVED = `
+// gh stub responding to:
+//   - `gh api repos/{owner}/{repo}/pulls/<n>/reviews...` → the JSON body
+//     provided by the caller
+//   - `gh api graphql ... PullRequestReview ... comments` → empty inline
+//     comments
+// Any other invocation is fatal so tests fail loudly on accidental
+// fallthrough (e.g. the adapter probing `gh api user`).
+function stubReviewsRest(reviewsJson: string): string {
+  return `
 case "$*" in
-  *"pr view"*"--json reviews"*)
+  *"api"*"pulls/"*"/reviews"*)
     cat <<'JSON'
-{"reviews":[{"id":"PRR_ok","state":"APPROVED","body":"LGTM","author":{"login":"didier-reviewer"},"commit":{"oid":"abc123"}}]}
+${reviewsJson}
 JSON
     exit 0
     ;;
-  *"api graphql"*)
+  *"api"*"graphql"*)
     echo '{"data":{"node":{"comments":{"nodes":[]}}}}'
     exit 0
     ;;
@@ -79,28 +85,35 @@ JSON
     ;;
 esac
 `;
+}
 
-const STUB_PREFIXED_AUTHOR_APPROVED = `
-case "$*" in
-  *"pr view"*"--json reviews"*)
-    cat <<'JSON'
-{"reviews":[{"id":"PRR_ok","state":"APPROVED","body":"LGTM","author":{"login":"app/didier-reviewer"},"commit":{"oid":"abc123"}}]}
-JSON
-    exit 0
-    ;;
-  *"api graphql"*)
-    echo '{"data":{"node":{"comments":{"nodes":[]}}}}'
-    exit 0
-    ;;
-  *)
-    echo "unexpected gh invocation: $*" 1>&2
-    exit 99
-    ;;
-esac
-`;
+// REST review row for a GitHub App author posting an APPROVED review.
+const BOT_APPROVED = `[
+  {
+    "id": 1,
+    "node_id": "PRR_bot",
+    "user": {"login": "didier-reviewer[bot]", "type": "Bot"},
+    "body": "LGTM (bot)",
+    "state": "APPROVED",
+    "commit_id": "abc123"
+  }
+]`;
 
-test("expectedLogin with app/ prefix matches a review author returned as a bare slug", () => {
-  installGhStub(STUB_BARE_AUTHOR_APPROVED);
+// REST review row for a regular user account posting an APPROVED review,
+// where the user's login coincidentally matches the App slug.
+const USER_APPROVED = `[
+  {
+    "id": 2,
+    "node_id": "PRR_user",
+    "user": {"login": "didier-reviewer", "type": "User"},
+    "body": "LGTM (user)",
+    "state": "APPROVED",
+    "commit_id": "abc123"
+  }
+]`;
+
+test("app/<slug> matches a Bot review with login <slug>[bot]", () => {
+  installGhStub(stubReviewsRest(BOT_APPROVED));
   const { reposRoot, repoId } = makeBareDir();
   const adapter = new GitHubCliAdapter(reposRoot);
   const posted = adapter.fetchPostedReview(
@@ -111,11 +124,11 @@ test("expectedLogin with app/ prefix matches a review author returned as a bare 
   );
   expect(posted).not.toBeNull();
   expect(posted!.decision).toBe("APPROVED");
-  expect(posted!.reviewId).toBe("PRR_ok");
+  expect(posted!.reviewId).toBe("PRR_bot");
 });
 
-test("expectedLogin without prefix still matches a bare-slug review author", () => {
-  installGhStub(STUB_BARE_AUTHOR_APPROVED);
+test("bare <slug> matches a User review with login <slug>", () => {
+  installGhStub(stubReviewsRest(USER_APPROVED));
   const { reposRoot, repoId } = makeBareDir();
   const adapter = new GitHubCliAdapter(reposRoot);
   const posted = adapter.fetchPostedReview(
@@ -126,10 +139,29 @@ test("expectedLogin without prefix still matches a bare-slug review author", () 
   );
   expect(posted).not.toBeNull();
   expect(posted!.decision).toBe("APPROVED");
+  expect(posted!.reviewId).toBe("PRR_user");
 });
 
-test("bare expectedLogin matches a review author returned with app/ prefix (symmetric)", () => {
-  installGhStub(STUB_PREFIXED_AUTHOR_APPROVED);
+test("app/<slug> does NOT match a regular user named <slug> (identity preserved)", () => {
+  // Approval-gate bypass guard: an attacker who controls a User account
+  // sharing the App slug must not be able to satisfy a gate intended for
+  // the App. The match must require user.type == "Bot".
+  installGhStub(stubReviewsRest(USER_APPROVED));
+  const { reposRoot, repoId } = makeBareDir();
+  const adapter = new GitHubCliAdapter(reposRoot);
+  const posted = adapter.fetchPostedReview(
+    repoId,
+    42,
+    "abc123",
+    "app/didier-reviewer",
+  );
+  expect(posted).toBeNull();
+});
+
+test("bare <slug> does NOT match a Bot review with login <slug>[bot] (identity preserved)", () => {
+  // Symmetric guard: an operator who configures the gate against a User
+  // account must not have it satisfied by a Bot of the same slug.
+  installGhStub(stubReviewsRest(BOT_APPROVED));
   const { reposRoot, repoId } = makeBareDir();
   const adapter = new GitHubCliAdapter(reposRoot);
   const posted = adapter.fetchPostedReview(
@@ -138,12 +170,11 @@ test("bare expectedLogin matches a review author returned with app/ prefix (symm
     "abc123",
     "didier-reviewer",
   );
-  expect(posted).not.toBeNull();
-  expect(posted!.decision).toBe("APPROVED");
+  expect(posted).toBeNull();
 });
 
-test("expectedLogin does not match a different bot after prefix stripping", () => {
-  installGhStub(STUB_BARE_AUTHOR_APPROVED);
+test("Bot review with wrong slug does not match", () => {
+  installGhStub(stubReviewsRest(BOT_APPROVED));
   const { reposRoot, repoId } = makeBareDir();
   const adapter = new GitHubCliAdapter(reposRoot);
   const posted = adapter.fetchPostedReview(
@@ -153,4 +184,39 @@ test("expectedLogin does not match a different bot after prefix stripping", () =
     "app/some-other-bot",
   );
   expect(posted).toBeNull();
+});
+
+test("review against an older head_sha is ignored", () => {
+  installGhStub(stubReviewsRest(BOT_APPROVED));
+  const { reposRoot, repoId } = makeBareDir();
+  const adapter = new GitHubCliAdapter(reposRoot);
+  const posted = adapter.fetchPostedReview(
+    repoId,
+    42,
+    "def456",
+    "app/didier-reviewer",
+  );
+  expect(posted).toBeNull();
+});
+
+test("most recent matching review wins when several share the author and SHA", () => {
+  // Iteration is newest-first; the adapter must return PRR_third (the
+  // last row), not PRR_first.
+  const multi = `[
+    {"id": 10, "node_id": "PRR_first",  "user": {"login": "didier-reviewer[bot]", "type": "Bot"}, "body": "first",  "state": "COMMENTED",        "commit_id": "abc123"},
+    {"id": 11, "node_id": "PRR_second", "user": {"login": "didier-reviewer[bot]", "type": "Bot"}, "body": "second", "state": "APPROVED",         "commit_id": "abc123"},
+    {"id": 12, "node_id": "PRR_third",  "user": {"login": "didier-reviewer[bot]", "type": "Bot"}, "body": "third",  "state": "CHANGES_REQUESTED","commit_id": "abc123"}
+  ]`;
+  installGhStub(stubReviewsRest(multi));
+  const { reposRoot, repoId } = makeBareDir();
+  const adapter = new GitHubCliAdapter(reposRoot);
+  const posted = adapter.fetchPostedReview(
+    repoId,
+    42,
+    "abc123",
+    "app/didier-reviewer",
+  );
+  expect(posted).not.toBeNull();
+  expect(posted!.reviewId).toBe("PRR_third");
+  expect(posted!.decision).toBe("CHANGES_REQUESTED");
 });

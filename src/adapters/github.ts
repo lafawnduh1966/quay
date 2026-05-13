@@ -211,54 +211,74 @@ export class GitHubCliAdapter implements GitHubPort {
     expectedLogin?: string,
   ): PostedReview | null {
     const login = expectedLogin ?? this.currentLogin(repoId);
-    const fields = ["reviews"].join(",");
-    const result = this.run(repoId, [
-      "gh",
-      "pr",
-      "view",
-      String(prNumber),
-      "--json",
-      fields,
-    ]);
+    // Match policy preserves *identity kind* (App vs. regular user). The
+    // previous `gh pr view --json reviews` projection only exposes
+    // `author.login`, and that field is shape-ambiguous: gh strips the
+    // `app/` prefix and the `[bot]` suffix for App-bot review authors, so
+    // an App-bot review by `app/foo` and a user review by `foo` both
+    // surface as `foo` — collapsing two distinct GitHub identities. If
+    // an operator pins `reviewer.login = "app/foo"`, only an App-bot
+    // review must satisfy the gate; a same-named user must not.
+    //
+    // The REST reviews endpoint (`/repos/{o}/{r}/pulls/<n>/reviews`)
+    // returns the discriminator we need: `user.type` is `"Bot"` for App
+    // authors and `"User"` for regular accounts, and `user.login` carries
+    // the `[bot]` suffix on Bot rows so the two paths cannot alias.
+    const isAppForm = login.startsWith("app/");
+    const expectedType: "Bot" | "User" = isAppForm ? "Bot" : "User";
+    const expectedBareLogin = isAppForm ? login.slice(4) : login;
+    // `?per_page=100` lifts the default page size (30) to cover practical
+    // review volumes on a single PR; we still iterate newest-first so the
+    // first match wins. If a PR ever exceeds 100 reviews from the same
+    // author we'd miss the most recent ones on subsequent pages — that's
+    // far beyond any real reviewer-bot workload, but the failure mode is
+    // a transient "no posted review yet" (a retry, not a wrong accept),
+    // so we don't paginate at the cost of a multi-call code path.
+    const path = `repos/{owner}/{repo}/pulls/${prNumber}/reviews?per_page=100`;
+    const result = this.run(repoId, ["gh", "api", path]);
     if (result.exitCode !== 0) {
       throw new Error(
-        `gh pr view ${prNumber} --json reviews failed: ${result.stderr.trim() || result.stdout.trim()}`,
+        `gh api ${path} failed: ${result.stderr.trim() || result.stdout.trim()}`,
       );
     }
-    let parsed: Record<string, unknown>;
+    let parsed: unknown;
     try {
-      parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+      parsed = JSON.parse(result.stdout);
     } catch (err) {
       throw new Error(
-        `gh pr view returned unparseable review JSON for PR #${prNumber}: ${(err as Error).message}`,
+        `gh api returned unparseable review JSON for PR #${prNumber}: ${(err as Error).message}`,
       );
     }
-    const reviews = Array.isArray(parsed.reviews)
-      ? (parsed.reviews as Array<Record<string, unknown>>)
-      : [];
-    // `gh pr view --json reviews` strips the `app/` prefix from App-bot author
-    // logins, but `gh pr view --json author` (and the form operators see in
-    // the GitHub UI / config) keeps it. Normalize both sides so an operator
-    // configured `reviewer.login = "app/<slug>"` matches a review whose
-    // `author.login` came back as `<slug>`, and vice versa.
-    const stripAppPrefix = (s: string): string =>
-      s.startsWith("app/") ? s.slice(4) : s;
-    const expected = stripAppPrefix(login);
+    if (!Array.isArray(parsed)) {
+      throw new Error(
+        `gh api returned non-array review JSON for PR #${prNumber}: ${result.stdout.trim().slice(0, 200)}`,
+      );
+    }
+    const reviews = parsed as Array<Record<string, unknown>>;
+    // A Bot's `user.login` carries the `[bot]` suffix in the REST API
+    // (e.g. `didier-reviewer[bot]`). Strip only for Bot rows so a
+    // collision with a real user named `didier-reviewer[bot]`-literal
+    // would still mismatch on `user.type`.
+    const stripBotSuffix = (s: string): string =>
+      s.endsWith("[bot]") ? s.slice(0, -"[bot]".length) : s;
     for (let i = reviews.length - 1; i >= 0; i -= 1) {
       const r = reviews[i] ?? {};
-      const author = (r.author ?? {}) as Record<string, unknown>;
-      const authorLogin = String(author.login ?? "");
-      if (stripAppPrefix(authorLogin) !== expected) continue;
-      const commit = (r.commit ?? {}) as Record<string, unknown>;
-      const oid = String(commit.oid ?? r.commitId ?? "");
-      if (oid !== headSha) continue;
+      const user = (r.user ?? {}) as Record<string, unknown>;
+      const userType = String(user.type ?? "");
+      if (userType !== expectedType) continue;
+      const userLogin = String(user.login ?? "");
+      const bareLogin =
+        expectedType === "Bot" ? stripBotSuffix(userLogin) : userLogin;
+      if (bareLogin !== expectedBareLogin) continue;
+      const commitId = String(r.commit_id ?? "");
+      if (commitId !== headSha) continue;
       const decision = mapPostedReviewDecision(r.state);
       if (decision === null) continue;
-      const reviewId = r.id !== undefined ? String(r.id) : "";
-      if (reviewId === "") continue;
-      const inline = this.fetchReviewInlineComments(repoId, reviewId);
+      const reviewNodeId = String(r.node_id ?? "");
+      if (reviewNodeId === "") continue;
+      const inline = this.fetchReviewInlineComments(repoId, reviewNodeId);
       return {
-        reviewId,
+        reviewId: reviewNodeId,
         decision,
         body: String(r.body ?? ""),
         comments: composeReviewFeedback(String(r.body ?? ""), inline),
