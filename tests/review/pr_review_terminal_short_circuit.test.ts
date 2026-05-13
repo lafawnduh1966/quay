@@ -7,6 +7,7 @@
 import { afterEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync } from "node:fs";
 import { tick_once } from "../../src/core/tick.ts";
+import { syntheticTaskId } from "../../src/core/pr_review.ts";
 import { createHarness, type Harness } from "../support/harness.ts";
 import { insertAttempt, insertRepo } from "../support/fixtures.ts";
 import { buildTickDeps } from "../support/tick_deps.ts";
@@ -197,4 +198,89 @@ test("pr-review task with externally-closed PR transitions to closed_unmerged an
   expect(built.git.localBranches.get(repoId)?.has(`quay/${taskId}`)).toBeFalsy();
   expect(built.git.remoteBranches.get(repoId)?.has(`quay/${taskId}`)).toBeFalsy();
   expect(built.tmux.killCalls).toContain(sessionName);
+});
+
+test("synthetic pr-review task probes by pr_number and short-circuits on external merge", async () => {
+  // Synthetic review tasks store `branch_name = quay-review/<num>`, an
+  // internal placeholder that has no GitHub ref. A branch-keyed prSnapshot
+  // returns null in that case (the real adapter's `gh pr view quay-review/8`
+  // would fall through to "no pull requests found"), so the short-circuit
+  // must dispatch to `prSnapshotByNumber`.
+  h = createHarness();
+  h.clock.set("2026-05-13T08:30:00.000Z");
+
+  const repoId = insertRepo(h.db, "repo-synthetic-merged");
+  const prNumber = 42;
+  const taskId = syntheticTaskId(repoId, prNumber);
+  const branchName = `quay-review/${prNumber}`;
+  const worktreePath = `${h.dataDir}/worktrees/synthetic-merged`;
+  mkdirSync(worktreePath, { recursive: true });
+  h.db
+    .query(
+      `INSERT INTO tasks (
+         task_id, repo_id, state, branch_name, tmux_id, worktree_path,
+         pr_number, head_sha, retry_budget, created_at, updated_at
+       ) VALUES (?, ?, 'pr-review', ?, ?, ?, ?, 'sha-42', 1, ?, ?)`,
+    )
+    .run(
+      taskId,
+      repoId,
+      branchName,
+      `synthetic-${prNumber}`,
+      worktreePath,
+      prNumber,
+      h.clock.nowISO(),
+      h.clock.nowISO(),
+    );
+  const attemptId = insertAttempt(h.db, {
+    taskId,
+    reason: "review_only",
+    consumedBudget: 0,
+    spawnedAt: h.clock.nowISO(),
+  });
+  const sessionName = "quay-review-synthetic-42-1";
+  h.db
+    .query(
+      `UPDATE attempts
+          SET head_sha = 'sha-42', tmux_session = ?
+        WHERE attempt_id = ?`,
+    )
+    .run(sessionName, attemptId);
+
+  const built = buildTickDeps(h);
+  built.tmux.liveSessions.add(sessionName);
+  // Deliberately do NOT seed setPrSnapshot for branch — branch-keyed lookup
+  // must miss; only the by-number lookup should surface terminal state.
+  built.github.setPrSnapshotByNumber(repoId, prNumber, {
+    prNumber,
+    state: "merged",
+    headSha: "sha-42",
+    baseSha: "base-42",
+    mergeable: "unknown",
+    latestReview: { decision: "APPROVED", latestReviewId: "R_synth", comments: "" },
+    checks: {
+      checkSha: "sha-42",
+      items: [{ name: "build", workflow: null, bucket: "pass", required: true }],
+    },
+  });
+
+  const results = await tick_once(built.deps, { reviewerEnabled: true });
+
+  expect(results).toEqual([{ task_id: taskId, action: "pr_merged" }]);
+
+  const task = h.db
+    .query<{ state: string }, [string]>(
+      `SELECT state FROM tasks WHERE task_id = ?`,
+    )
+    .get(taskId);
+  expect(task?.state).toBe("merged");
+
+  const attempt = h.db
+    .query<{ review_verdict: string | null }, [number]>(
+      `SELECT review_verdict FROM attempts WHERE attempt_id = ?`,
+    )
+    .get(attemptId);
+  expect(attempt?.review_verdict).toBe("superseded");
+  expect(built.tmux.killCalls).toContain(sessionName);
+  expect(existsSync(worktreePath)).toBe(false);
 });

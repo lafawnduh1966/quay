@@ -199,6 +199,7 @@ interface PrReviewTaskRow {
   repo_id: string;
   branch_name: string;
   worktree_path: string;
+  pr_number: number | null;
   cancel_requested_at: string | null;
 }
 
@@ -550,7 +551,7 @@ function readPrReview(db: DB): PrReviewTaskRow[] {
   return db
     .query<PrReviewTaskRow, []>(
       `SELECT task_id, repo_id, branch_name, worktree_path,
-              cancel_requested_at
+              pr_number, cancel_requested_at
          FROM tasks
         WHERE state = 'pr-review'
         ORDER BY created_at, task_id`,
@@ -1004,7 +1005,15 @@ function processPrReviewTerminal(
   // pr-review only consults the snapshot for terminal short-circuit. A
   // missing snapshot must not block the review-attempt iteration; fall
   // through and let the next tick re-probe.
-  const snapshot = deps.github.prSnapshot(task.repo_id, task.branch_name);
+  //
+  // Synthetic review tasks store `branch_name = quay-review/<num>` — an
+  // internal placeholder that has no GitHub ref — so a branch-keyed
+  // `prSnapshot` would always return null and miss the external merge /
+  // close. For those, probe by PR number instead.
+  const snapshot =
+    isSyntheticTaskId(task.task_id) && task.pr_number !== null
+      ? deps.github.prSnapshotByNumber(task.repo_id, task.pr_number)
+      : deps.github.prSnapshot(task.repo_id, task.branch_name);
   if (snapshot === null) return null;
   if (snapshot.state !== "merged" && snapshot.state !== "closed_unmerged") {
     return null;

@@ -15,6 +15,7 @@ export class FakeGitHub implements GitHubPort {
   // Explicit per-(repo, branch) PR snapshots take precedence over the legacy
   // `setPrCheckStatus`-derived synthesis.
   readonly snapshots = new Map<string, PrSnapshot | null>();
+  readonly snapshotsByNumber = new Map<string, PrSnapshot | null>();
   readonly prViews = new Map<string, PullRequestView | null>();
   readonly postedReviews = new Map<string, PostedReview | null>();
 
@@ -59,6 +60,19 @@ export class FakeGitHub implements GitHubPort {
 
   setPrSnapshot(repoId: string, branch: string, snapshot: PrSnapshot | null): void {
     this.snapshots.set(`${repoId}\0${branch}`, snapshot);
+  }
+
+  prSnapshotByNumber(repoId: string, prNumber: number): PrSnapshot | null {
+    const key = `${repoId}\0${prNumber}`;
+    return this.snapshotsByNumber.get(key) ?? null;
+  }
+
+  setPrSnapshotByNumber(
+    repoId: string,
+    prNumber: number,
+    snapshot: PrSnapshot | null,
+  ): void {
+    this.snapshotsByNumber.set(`${repoId}\0${prNumber}`, snapshot);
   }
 
   prView(repoId: string, prNumber: number): PullRequestView | null {

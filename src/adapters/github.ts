@@ -106,6 +106,19 @@ export class GitHubCliAdapter implements GitHubPort {
   }
 
   prSnapshot(repoId: string, branch: string): PrSnapshot | null {
+    return this.prSnapshotBySelector(repoId, branch);
+  }
+
+  prSnapshotByNumber(repoId: string, prNumber: number): PrSnapshot | null {
+    // `gh pr view` / `gh pr checks` accept either a branch ref or a numeric
+    // PR id as the positional selector; the underlying helpers are agnostic.
+    return this.prSnapshotBySelector(repoId, String(prNumber));
+  }
+
+  private prSnapshotBySelector(
+    repoId: string,
+    selector: string,
+  ): PrSnapshot | null {
     // Spec §5 / §12: tick must reject CI evaluation when the check rows it
     // sees were produced against a SHA that's no longer the PR head (force
     // push or GitHub lag). `gh pr checks --json` does not surface a per-row
@@ -121,11 +134,12 @@ export class GitHubCliAdapter implements GitHubPort {
     // If a force-push lands between the two reads, the two SHAs disagree;
     // `classifyCi` returns "stale" and tick logs `tick_error` rather than
     // transitioning on possibly-old green checks.
-    const view = this.fetchPrView(repoId, branch);
+    const view = this.fetchPrView(repoId, selector);
     if (view === null) return null;
     const headShaBefore = view.headSha;
-    const checks = this.fetchChecks(repoId, branch);
-    const headShaAfter = this.fetchHeadShaOnly(repoId, branch) ?? headShaBefore;
+    const checks = this.fetchChecks(repoId, selector);
+    const headShaAfter =
+      this.fetchHeadShaOnly(repoId, selector) ?? headShaBefore;
     const snapshot: PrSnapshot = {
       state: view.state,
       prNumber: view.prNumber ?? null,

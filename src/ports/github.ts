@@ -25,6 +25,12 @@ export interface GitHubPort {
   // the adapter throws — tick treats that as a transient failure and logs
   // `tick_error` for the task.
   prSnapshot(repoId: string, branch: string): PrSnapshot | null;
+  // Same shape as `prSnapshot` but addresses the PR by its numeric id rather
+  // than by branch ref. The `pr-review` terminal short-circuit uses this for
+  // synthetic review tasks whose `branch_name` is the internal placeholder
+  // `quay-review/<num>` — not a real GitHub ref — so a branch-keyed lookup
+  // would always return null and miss external merges/closes.
+  prSnapshotByNumber(repoId: string, prNumber: number): PrSnapshot | null;
   prView(repoId: string, prNumber: number): PullRequestView | null;
   // `expectedLogin` overrides the adapter's auto-probed identity when the
   // reviewer worker posts under a different gh login than the tick process.
