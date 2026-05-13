@@ -9,7 +9,7 @@
 //   - PR open?:           `gh pr list --head <branch> --state open --json number`
 //   - PR snapshot fields: `gh pr view <branch> --json number,url,state,headRefOid,
 //                                                baseRefName,mergeable,
-//                                                reviewDecision,latestReviews`
+//                                                reviewDecision,latestReviews,reviews`
 //     `baseRefOid` is intentionally NOT in this set — it was added in gh
 //     2.46 and a successful read on older gh installs (e.g. 2.45.0) errors
 //     with "Unknown JSON field: baseRefOid", which would knock out the whole
@@ -17,11 +17,16 @@
 //     `baseRefName` (universally supported) and resolve it to a SHA via a
 //     `git merge-base origin/<baseRefName> <headRefOid>` shell-out against
 //     the bare clone (already fetched by tick before calling this).
+//     `reviews` is requested alongside `latestReviews` to recover the review
+//     node id when gh's `latestReviews` projection emits `id: ""` (observed
+//     on the gh that ships with current Debian/Ubuntu): same review surfaces
+//     under `reviews` with the real `PRR_…` id, so the inline-comment fetch
+//     can key off that instead of looping on an empty id.
 //   - Inline review comments (CHANGES_REQUESTED only):
 //                         `gh api graphql -f query='... PullRequestReview.comments ...'`
-//                         keyed by the review's node id from `latestReviews`. Folded
-//                         into `latestReview.comments` so the worker's respawn artifact
-//                         actually carries the actionable feedback.
+//                         keyed by the review's node id from `latestReviews`/`reviews`.
+//                         Folded into `latestReview.comments` so the worker's respawn
+//                         artifact actually carries the actionable feedback.
 //   - Required-check set: `gh pr checks <branch> --json bucket,workflow,name,state`
 //   - Closing the PR:     `gh pr close <branch>`  (idempotent: tolerates "already closed"
 //                                                  and "no PR" by inspecting stderr)
@@ -365,6 +370,12 @@ export class GitHubCliAdapter implements GitHubPort {
       "mergeable",
       "reviewDecision",
       "latestReviews",
+      // `reviews` is requested as a backstop for the review node id: some
+      // gh CLI versions return `latestReviews[].id` as the empty string
+      // while the same review row under `reviews` carries the real
+      // `PRR_…` node id. `extractLatestReview` falls back to this list
+      // when the picked `latestReviews` entry has no usable id.
+      "reviews",
     ].join(",");
     const result = this.run(repoId, [
       "gh",
@@ -494,7 +505,12 @@ export class GitHubCliAdapter implements GitHubPort {
     base: PrLatestReview,
   ): PrLatestReview {
     if (base.decision !== "CHANGES_REQUESTED") return base;
-    if (base.latestReviewId === null) return base;
+    // Skip on null OR empty string. `extractLatestReview` normalises a
+    // missing id to null, but the empty-string check is a belt-and-
+    // suspenders guard: a graphql `node(id: "")` call returns "Could not
+    // resolve to a node with the global id of ''" and tick loops on it
+    // every cycle with no circuit breaker.
+    if (!base.latestReviewId) return base;
     const inline = this.fetchReviewInlineComments(repoId, base.latestReviewId);
     if (inline.length === 0 && base.comments.trim() === "") return base;
     return { ...base, comments: composeReviewFeedback(base.comments, inline) };
@@ -1049,7 +1065,7 @@ function extractLatestReview(parsed: Record<string, unknown>): PrLatestReview {
   const latest = Array.isArray(parsed.latestReviews)
     ? (parsed.latestReviews as Array<Record<string, unknown>>)
     : [];
-  let latestReviewId: string | null = null;
+  let pick: Record<string, unknown> | null = null;
   let comments = "";
   if (latest.length > 0) {
     // `gh` returns reviews ordered chronologically; pick the last
@@ -1061,13 +1077,50 @@ function extractLatestReview(parsed: Record<string, unknown>): PrLatestReview {
             (r) => String(r.state ?? "").toUpperCase() === "CHANGES_REQUESTED",
           )
         : latest;
-    const pick = wanted[wanted.length - 1] ?? null;
+    pick = wanted[wanted.length - 1] ?? null;
     if (pick) {
-      latestReviewId = pick.id !== undefined ? String(pick.id) : null;
       comments = pick.body !== undefined ? String(pick.body) : "";
     }
   }
+  const latestReviewId = resolveReviewNodeId(pick, parsed);
   return { decision, latestReviewId, comments };
+}
+
+// Recover the review node id for the picked `latestReviews` entry. Some
+// `gh` versions return `latestReviews[].id` as the empty string while the
+// same review surfaces under `--json reviews` with the real GraphQL node
+// id (`PRR_…`). Trust `latestReviews[].id` when populated; otherwise walk
+// `reviews` newest-first and match by state (preferring an exact
+// `submittedAt` match when both sides expose one). Return null when no
+// usable id can be resolved — the enrichment guard skips the graphql
+// fetch on null so tick doesn't loop on empty-id errors.
+function resolveReviewNodeId(
+  picked: Record<string, unknown> | null,
+  parsed: Record<string, unknown>,
+): string | null {
+  if (picked === null) return null;
+  const pickedId = picked.id !== undefined ? String(picked.id) : "";
+  if (pickedId !== "") return pickedId;
+  const reviews = Array.isArray(parsed.reviews)
+    ? (parsed.reviews as Array<Record<string, unknown>>)
+    : [];
+  if (reviews.length === 0) return null;
+  const pickedState = String(picked.state ?? "").toUpperCase();
+  const pickedSubmittedAt = String(picked.submittedAt ?? "");
+  let stateMatch: string | null = null;
+  for (let i = reviews.length - 1; i >= 0; i -= 1) {
+    const r = reviews[i] ?? {};
+    const id = String(r.id ?? "");
+    if (id === "") continue;
+    const state = String(r.state ?? "").toUpperCase();
+    if (state !== pickedState) continue;
+    const submittedAt = String(r.submittedAt ?? "");
+    if (pickedSubmittedAt !== "" && submittedAt === pickedSubmittedAt) {
+      return id;
+    }
+    if (stateMatch === null) stateMatch = id;
+  }
+  return stateMatch;
 }
 
 function mapReviewDecision(raw: unknown): PrReviewDecision {
