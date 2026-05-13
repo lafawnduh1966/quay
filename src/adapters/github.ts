@@ -236,11 +236,19 @@ export class GitHubCliAdapter implements GitHubPort {
     const reviews = Array.isArray(parsed.reviews)
       ? (parsed.reviews as Array<Record<string, unknown>>)
       : [];
+    // `gh pr view --json reviews` strips the `app/` prefix from App-bot author
+    // logins, but `gh pr view --json author` (and the form operators see in
+    // the GitHub UI / config) keeps it. Normalize both sides so an operator
+    // configured `reviewer.login = "app/<slug>"` matches a review whose
+    // `author.login` came back as `<slug>`, and vice versa.
+    const stripAppPrefix = (s: string): string =>
+      s.startsWith("app/") ? s.slice(4) : s;
+    const expected = stripAppPrefix(login);
     for (let i = reviews.length - 1; i >= 0; i -= 1) {
       const r = reviews[i] ?? {};
       const author = (r.author ?? {}) as Record<string, unknown>;
       const authorLogin = String(author.login ?? "");
-      if (authorLogin !== login) continue;
+      if (stripAppPrefix(authorLogin) !== expected) continue;
       const commit = (r.commit ?? {}) as Record<string, unknown>;
       const oid = String(commit.oid ?? r.commitId ?? "");
       if (oid !== headSha) continue;

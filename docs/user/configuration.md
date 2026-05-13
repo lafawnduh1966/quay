@@ -93,6 +93,12 @@ bot account); leaving it unset in that setup will silently never match the
 posted review and park the task in `non_budget_loop` after the infra-failure
 retry budget runs out.
 
+Both bare slugs (`my-reviewer-bot`) and `app/`-prefixed slugs
+(`app/my-reviewer-bot`) are accepted: tick strips the `app/` prefix on both
+the configured login and the review's `author.login` before comparing, because
+`gh pr view --json reviews` returns App-bot review authors as the bare slug
+while `gh pr view --json author` and the GitHub UI show the `app/` form.
+
 `gh_token_file` makes the reviewer tmux pane authenticate to GitHub as a
 different identity than the worker that opened the PR. GitHub refuses
 self-review, so a deployment where worker and reviewer share the same `gh`
