@@ -28,7 +28,8 @@ Each cycle:
 3. Polls `pr-open` tasks for PR state, conflicts, and CI.
 4. Polls `done` tasks for PR state, conflicts, and review feedback.
 5. Releases stale orchestrator claims.
-6. Posts and polls `waiting_human` Slack threads.
+6. Handles claimless legacy `waiting_human` rows, either through the old Slack
+   path or by requeueing rows that have no thread.
 7. Reaps and spawns `pr-review` reviewer attempts up to
    `max_concurrent_reviewers` when `[reviewer].enabled = true`.
 8. Promotes `queued` tasks to `running` up to `max_concurrent`.
@@ -121,6 +122,20 @@ quay escalate-human <task_id> \
   --claim-id <claim_id> \
   --question-file ./question.md \
   --thread-ref C123456:1712345678.901234
+```
+
+After the orchestrator receives the human answer:
+
+```bash
+quay record-human-reply <task_id> \
+  --claim-id <claim_id> \
+  --reply-file ./reply.md \
+  --thread-ref C123456:1712345678.901234
+
+quay submit-brief <task_id> \
+  --claim-id <claim_id> \
+  --brief-file ./next-brief.md \
+  --reason advice_answered
 ```
 
 `submit-brief --reason blocker_resolved` consumes retry budget when promoted.

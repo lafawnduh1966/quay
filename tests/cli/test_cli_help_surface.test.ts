@@ -54,6 +54,7 @@ test("quay --help prints command list to stdout, exit 0", async () => {
     "cancel",
     "submit-brief",
     "escalate-human",
+    "record-human-reply",
     "artifact",
     "validate-ticket",
     "--version",

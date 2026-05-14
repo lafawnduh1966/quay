@@ -8,7 +8,12 @@ import { claim_task, escalate_human } from "../../src/core/claims.ts";
 import { tick_once } from "../../src/core/tick.ts";
 import { clearAllFailpoints, setFailpoint } from "../../src/core/failpoints.ts";
 import { createHarness, type Harness } from "../support/harness.ts";
-import { insertAttempt, insertRepo, insertTask } from "../support/fixtures.ts";
+import {
+  insertAttempt,
+  insertRepo,
+  insertTask,
+  markWaitingHumanLegacy,
+} from "../support/fixtures.ts";
 import { buildTickDeps } from "../support/tick_deps.ts";
 
 let h: Harness | null = null;
@@ -54,6 +59,7 @@ test("test_011b_tick_recovers_posted_slack_message_by_nonce", async () => {
     },
   );
   if (!esc.ok) throw new Error("expected escalation success");
+  markWaitingHumanLegacy(h.db, taskId);
 
   // Crash immediately after Slack returns ts but before SQL persistence.
   setFailpoint("after_slack_post", () => {

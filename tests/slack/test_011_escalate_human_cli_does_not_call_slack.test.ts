@@ -1,6 +1,5 @@
-// Spec §15 case 11: `escalate-human` CLI is SQL/artifact-only — no Slack
-// call. Tick is the single Slack writer; the post lands inside one tick
-// interval of the CLI returning.
+// `escalate-human` is SQL/artifact-only. New human-advice flow keeps the
+// orchestrator claim live and tick does not own Slack transport for that row.
 
 import { afterEach, expect, test } from "bun:test";
 import { claim_task, escalate_human } from "../../src/core/claims.ts";
@@ -63,7 +62,7 @@ test("test_011_escalate_human_cli_does_not_call_slack", async () => {
     )
     .get(taskId);
   expect(taskMid!.state).toBe("waiting_human");
-  expect(taskMid!.claim_id).toBeNull();
+  expect(taskMid!.claim_id).toBe(claim.value.claim_id);
 
   const artBefore = h.db
     .query<
@@ -76,21 +75,13 @@ test("test_011_escalate_human_cli_does_not_call_slack", async () => {
   expect(artBefore!.slack_post_ts).toBeNull();
   expect(artBefore!.slack_recovered_post_ts).toBeNull();
 
-  // Tick now performs the post under the supervisor lock.
+  // Tick leaves claim-held waiting_human rows to the orchestrator.
   const results = await tick_once(built.deps);
 
-  expect(built.slack.fenceCalls).toHaveLength(1);
-  expect(built.slack.searchCalls).toHaveLength(1);
-  expect(built.slack.postCalls).toHaveLength(1);
-  expect(built.slack.postCalls[0]!.threadRef).toBe("C123:0.42");
-  expect(built.slack.postCalls[0]!.body).toContain("is this approach OK?");
-  expect(built.slack.postCalls[0]!.body).toContain(esc.value.escalation_nonce);
-
-  const actions = results
-    .filter((r) => r.task_id === taskId)
-    .map((r) => r.action);
-  expect(actions).toContain("slack_fence_captured");
-  expect(actions).toContain("slack_posted");
+  expect(results.filter((r) => r.task_id === taskId)).toEqual([]);
+  expect(built.slack.fenceCalls).toHaveLength(0);
+  expect(built.slack.searchCalls).toHaveLength(0);
+  expect(built.slack.postCalls).toHaveLength(0);
 
   const artAfter = h.db
     .query<
@@ -100,6 +91,6 @@ test("test_011_escalate_human_cli_does_not_call_slack", async () => {
       `SELECT slack_post_ts, slack_recovered_post_ts FROM artifacts WHERE artifact_id = ?`,
     )
     .get(esc.value.artifact_id);
-  expect(artAfter!.slack_post_ts).not.toBeNull();
-  expect(artAfter!.slack_recovered_post_ts).toBe(artAfter!.slack_post_ts);
+  expect(artAfter!.slack_post_ts).toBeNull();
+  expect(artAfter!.slack_recovered_post_ts).toBeNull();
 });

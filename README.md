@@ -190,7 +190,7 @@ quay tags list --repo <repo_id>                            # merged vocab + enfo
 quay handoff list [--status <s>] [--task <id>] # durable awaiting-next-brief handoffs
                                                # (JSON; default status is pending)
 quay task get <task_id> | task list        # read commands (deterministic JSON)
-quay submit-brief | escalate-human | cancel
+quay submit-brief | escalate-human | record-human-reply | cancel
 quay artifact get <task_id> <kind>         # raw bytes to stdout
 ```
 

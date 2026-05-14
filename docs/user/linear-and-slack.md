@@ -70,18 +70,17 @@ not fetched.
 
 ## Human Escalation
 
-`quay escalate-human` does not post to Slack immediately. It persists a
-`slack_escalation_post` artifact, records a nonce, transitions the task to
-`waiting_human`, and releases the orchestrator claim.
+`quay escalate-human` persists a `slack_escalation_post` artifact, records a
+nonce, and transitions the task to `waiting_human` while preserving the
+orchestrator claim. Quay does not post to Slack for this new flow. The
+orchestrator chooses the Slack route, posts the question, waits for the answer,
+then calls `quay record-human-reply` followed by
+`quay submit-brief --reason advice_answered`.
 
-A later `quay tick`:
-
-1. Captures a Slack thread fence timestamp.
-2. Searches for an existing bot post with the nonce.
-3. Posts the question if needed.
-4. Polls for the first non-bot reply after the post/fence.
-5. Stores `slack_reply`.
-6. Transitions the task to `awaiting-next-brief`.
+Claimless legacy `waiting_human` rows still use the old tick-owned Slack
+posting/reply ingestion path when they already have a `slack_thread_ref`. Legacy
+rows without a thread are requeued to `awaiting-next-brief` so the orchestrator
+can apply deployment-owned fallback routing.
 
 If the task has authors from a Linear `quay-config` block, Quay prefixes valid
 Slack user mentions on the escalation post.

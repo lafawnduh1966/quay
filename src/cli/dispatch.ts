@@ -39,9 +39,11 @@ import {
   release_claim,
   submit_brief,
   escalate_human,
+  record_human_reply,
   type ClaimDeps,
   type SubmitBriefDeps,
   type EscalateHumanDeps,
+  type RecordHumanReplyDeps,
   type ServiceResult,
 } from "../core/claims.ts";
 import {
@@ -177,6 +179,8 @@ export async function dispatch(
         return await handleSubmitBrief(rest, deps, io);
       case "escalate-human":
         return await handleEscalateHuman(rest, deps, io);
+      case "record-human-reply":
+        return await handleRecordHumanReply(rest, deps, io);
       case "artifact":
         return handleArtifact(rest, deps, io);
       default:
@@ -1481,6 +1485,59 @@ async function handleEscalateHuman(
   const escalateLinear = pickLinearAdapter(deps);
   if (escalateLinear !== undefined) escalateDeps.linear = escalateLinear;
   return emitServiceResult(await escalate_human(escalateDeps, input), io);
+}
+
+async function handleRecordHumanReply(
+  argv: string[],
+  deps: CliDeps,
+  io: CliIO,
+): Promise<DispatchResult> {
+  if (wantsHelp(argv)) return printHelp(io, ["record-human-reply"]);
+  const json = tryParseJsonFlag(argv);
+  if (!json.ok) return writeError(io, "usage_error", json.message);
+  let input: {
+    taskId: string;
+    claimId: string;
+    replyBody: string;
+    threadRef?: string | null;
+    messageTs?: string | null;
+    author?: string | null;
+  };
+  if (json.value !== undefined) {
+    input = json.value as never;
+  } else {
+    const taskId = positional(argv);
+    const claimId = readFlag(argv, "--claim-id");
+    const replyFile = readFlag(argv, "--reply-file");
+    const threadRef = readFlag(argv, "--thread-ref");
+    const messageTs = readFlag(argv, "--message-ts");
+    const author = readFlag(argv, "--author");
+    if (!taskId || !claimId || !replyFile) {
+      return writeError(
+        io,
+        "usage_error",
+        "record-human-reply requires <task_id> --claim-id <id> --reply-file <path> [--thread-ref <ref>] [--message-ts <ts>] [--author <name>]",
+      );
+    }
+    const replyRead = tryReadFile(replyFile);
+    if (!replyRead.ok) return writeError(io, "usage_error", replyRead.message);
+    input = {
+      taskId,
+      claimId,
+      replyBody: replyRead.value,
+      threadRef: threadRef ?? null,
+      messageTs: messageTs ?? null,
+      author: author ?? null,
+    };
+  }
+  const recordDeps: RecordHumanReplyDeps = {
+    db: deps.db,
+    clock: deps.clock,
+    artifactStore: deps.artifactStore,
+  };
+  const recordLinear = pickLinearAdapter(deps);
+  if (recordLinear !== undefined) recordDeps.linear = recordLinear;
+  return emitServiceResult(await record_human_reply(recordDeps, input), io);
 }
 
 interface ArtifactRow {

@@ -368,11 +368,25 @@ const COMMANDS: Record<string, CommandSpec> = {
     path: "escalate-human",
     synopsis:
       "quay escalate-human <task_id> --claim-id <id> --question-file <path> [--thread-ref <ref>]",
-    summary: "Escalate a blocked task; tick later opens the Slack thread.",
+    summary: "Record a human question while the orchestrator owns the wait.",
     flags: [
       { flag: "--claim-id <id>", desc: "The claim_id held by the caller (required)." },
       { flag: "--question-file <path>", desc: "Path to the question body (required)." },
-      { flag: "--thread-ref <ref>", desc: "Optional pre-existing Slack thread ref." },
+      { flag: "--thread-ref <ref>", desc: "Optional Slack thread ref chosen by the orchestrator." },
+      { flag: "--input <json>", desc: "Alternative: pass the full payload as JSON." },
+    ],
+  },
+  "record-human-reply": {
+    path: "record-human-reply",
+    synopsis:
+      "quay record-human-reply <task_id> --claim-id <id> --reply-file <path> [--thread-ref <ref>] [--message-ts <ts>] [--author <name>]",
+    summary: "Persist a human answer and return the task to the claimed state.",
+    flags: [
+      { flag: "--claim-id <id>", desc: "The claim_id held by the caller (required)." },
+      { flag: "--reply-file <path>", desc: "Path to the human reply body (required)." },
+      { flag: "--thread-ref <ref>", desc: "Optional Slack thread ref for audit metadata." },
+      { flag: "--message-ts <ts>", desc: "Optional Slack message timestamp." },
+      { flag: "--author <name>", desc: "Optional reply author display name or id." },
       { flag: "--input <json>", desc: "Alternative: pass the full payload as JSON." },
     ],
   },
@@ -407,6 +421,7 @@ const TOP_LEVEL_ORDER: string[] = [
   "cancel",
   "submit-brief",
   "escalate-human",
+  "record-human-reply",
   "artifact",
 ];
 

@@ -53,6 +53,16 @@ export function insertTask(db: DB, opts: InsertTaskOptions = {}): string {
   return taskId;
 }
 
+export function markWaitingHumanLegacy(db: DB, taskId: string): void {
+  db.query(
+    `UPDATE tasks
+        SET claim_id = NULL,
+            claimed_at = NULL
+      WHERE task_id = ?
+        AND state = 'waiting_human'`,
+  ).run(taskId);
+}
+
 export interface InsertAttemptOptions {
   taskId: string;
   attemptNumber?: number;

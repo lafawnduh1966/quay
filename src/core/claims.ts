@@ -7,8 +7,12 @@
 //   - release_claim     — ownership-fenced release back to awaiting-next-brief.
 //   - submit_brief      — claim-scoped brief submission; schedules a pending
 //                         attempt + transitions to queued. Never spawns.
-//   - escalate_human    — claim-scoped slack_escalation_post artifact + state
+//   - escalate_human    — claim-scoped human-question artifact + state
 //                         transition to waiting_human. Never calls Slack.
+//                         The claim remains live so the orchestrator owns the
+//                         ask/wait/reply loop.
+//   - record_human_reply — claim-scoped human-reply artifact + transition back
+//                         to claimed-by-orchestrator before submit_brief.
 //
 // Errors flow back as a discriminated union so callers can distinguish
 // `claim_lost`, `cancelled`, `wrong_state`, `unknown_task`, and
@@ -77,7 +81,13 @@ export interface EscalateHumanResult {
   artifact_id: number;
   escalation_seq: number;
   escalation_nonce: string;
-  thread_ref: string;
+  thread_ref: string | null;
+}
+
+export interface RecordHumanReplyResult {
+  task_id: string;
+  state: "claimed-by-orchestrator";
+  artifact_id: number;
 }
 
 export interface ClaimDeps {
@@ -93,6 +103,11 @@ export interface SubmitBriefDeps extends ClaimDeps {
 export interface EscalateHumanDeps extends ClaimDeps {
   artifactStore: ArtifactStore;
   ids: IdGenerator;
+  linear?: LinearPort;
+}
+
+export interface RecordHumanReplyDeps extends ClaimDeps {
+  artifactStore: ArtifactStore;
   linear?: LinearPort;
 }
 
@@ -117,6 +132,15 @@ export interface EscalateHumanInput {
   claimId: string;
   questionBody: string;
   threadRef?: string | null;
+}
+
+export interface RecordHumanReplyInput {
+  taskId: string;
+  claimId: string;
+  replyBody: string;
+  threadRef?: string | null;
+  messageTs?: string | null;
+  author?: string | null;
 }
 
 interface TaskRow {
@@ -234,7 +258,7 @@ export function release_claim(
       value: { task_id: input.taskId, state: "awaiting-next-brief", released: false },
     };
   }
-  if (row.state !== "claimed-by-orchestrator") {
+  if (row.state !== "claimed-by-orchestrator" && row.state !== "waiting_human") {
     return fail("wrong_state", `task ${input.taskId} is in state ${row.state}`, {
       task_id: input.taskId,
       state: row.state,
@@ -259,7 +283,7 @@ export function release_claim(
                 claim_id = NULL,
                 updated_at = ?
           WHERE task_id = ?
-            AND state = 'claimed-by-orchestrator'
+            AND state IN ('claimed-by-orchestrator', 'waiting_human')
             AND claim_id = ?
             AND cancel_requested_at IS NULL`,
       )
@@ -288,7 +312,10 @@ export function release_claim(
           },
         };
       }
-      if (fresh.state === "claimed-by-orchestrator" && fresh.claim_id !== input.claimId) {
+      if (
+        (fresh.state === "claimed-by-orchestrator" || fresh.state === "waiting_human") &&
+        fresh.claim_id !== input.claimId
+      ) {
         return fail(
           "claim_lost",
           `claim_id mismatch on release_claim for task ${input.taskId}`,
@@ -304,9 +331,9 @@ export function release_claim(
       .query(
         `INSERT INTO events (
            task_id, event_type, from_state, to_state, occurred_at
-         ) VALUES (?, 'claim_released', 'claimed-by-orchestrator', 'awaiting-next-brief', ?)`,
+         ) VALUES (?, 'claim_released', ?, 'awaiting-next-brief', ?)`,
       )
-      .run(input.taskId, now);
+      .run(input.taskId, row.state, now);
     reopenClaimedOrchestratorHandoffs(deps, {
       taskId: input.taskId,
       claimId: input.claimId,
@@ -531,13 +558,6 @@ export async function escalate_human(
     input.threadRef !== undefined && input.threadRef !== null
       ? input.threadRef
       : row.slack_thread_ref;
-  if (threadRef === null) {
-    return fail(
-      "validation_error",
-      `task ${input.taskId} has no slack thread; pass threadRef or set on enqueue`,
-      { task_id: input.taskId },
-    );
-  }
 
   const prior = loadLatestAttempt(deps.db, input.taskId);
   if (!prior) {
@@ -591,8 +611,6 @@ export async function escalate_human(
       .query(
         `UPDATE tasks
             SET state = 'waiting_human',
-                claimed_at = NULL,
-                claim_id = NULL,
                 claim_expirations_consecutive = 0,
                 next_escalation_seq = next_escalation_seq + 1,
                 slack_thread_ref = ?,
@@ -639,10 +657,6 @@ export async function escalate_human(
          ) VALUES (?, ?, 'human_escalated', 'claimed-by-orchestrator', 'waiting_human', ?, ?)`,
       )
       .run(input.taskId, prior.attempt_id, artifact.artifactId, now);
-    completeClaimedOrchestratorHandoffs(deps, {
-      taskId: input.taskId,
-      claimId: input.claimId,
-    });
     deps.db.exec("COMMIT");
   } catch (err) {
     try {
@@ -662,6 +676,133 @@ export async function escalate_human(
       escalation_seq: seq,
       escalation_nonce: nonce,
       thread_ref: threadRef,
+    },
+  };
+}
+
+export async function record_human_reply(
+  deps: RecordHumanReplyDeps,
+  input: RecordHumanReplyInput,
+): Promise<ServiceResult<RecordHumanReplyResult>> {
+  const row = loadTask(deps.db, input.taskId);
+  if (!row) {
+    return fail("unknown_task", `task ${input.taskId} not found`, {
+      task_id: input.taskId,
+    });
+  }
+  if (row.cancel_requested_at !== null) {
+    return fail("cancelled", `task ${input.taskId} has cancel_requested_at set`, {
+      task_id: input.taskId,
+    });
+  }
+  if (row.state !== "waiting_human") {
+    return fail("wrong_state", `task ${input.taskId} is in state ${row.state}`, {
+      task_id: input.taskId,
+      state: row.state,
+    });
+  }
+  if (row.claim_id !== input.claimId) {
+    return fail(
+      "claim_lost",
+      `claim_id mismatch on record_human_reply for task ${input.taskId}`,
+      { task_id: input.taskId },
+    );
+  }
+
+  const prior = loadLatestAttempt(deps.db, input.taskId);
+  if (!prior) {
+    return fail(
+      "wrong_state",
+      `task ${input.taskId} has no attempt to attach a human reply to`,
+      { task_id: input.taskId },
+    );
+  }
+
+  const replyContent = JSON.stringify({
+    text: input.replyBody,
+    thread_ref: input.threadRef ?? row.slack_thread_ref,
+    message_ts: input.messageTs ?? null,
+    author: input.author ?? null,
+    source: "orchestrator",
+  });
+  const now = deps.clock.nowISO();
+
+  let artifactId = -1;
+  deps.db.exec("BEGIN IMMEDIATE");
+  try {
+    const artifact = deps.artifactStore.writeArtifact({
+      taskId: input.taskId,
+      attemptId: prior.attempt_id,
+      kind: "slack_reply",
+      content: replyContent,
+      extension: "json",
+    });
+    artifactId = artifact.artifactId;
+
+    const upd = deps.db
+      .query(
+        `UPDATE tasks
+            SET state = 'claimed-by-orchestrator',
+                claimed_at = ?,
+                tick_error = NULL,
+                updated_at = ?
+          WHERE task_id = ?
+            AND state = 'waiting_human'
+            AND claim_id = ?
+            AND cancel_requested_at IS NULL`,
+      )
+      .run(now, now, input.taskId, input.claimId);
+    const changes = (upd as { changes?: number }).changes ?? 0;
+    if (changes === 0) {
+      const fresh = loadTask(deps.db, input.taskId);
+      deps.db.exec("ROLLBACK");
+      if (!fresh) {
+        return fail("unknown_task", `task ${input.taskId} not found`, {
+          task_id: input.taskId,
+        });
+      }
+      if (fresh.cancel_requested_at !== null) {
+        return fail("cancelled", `task ${input.taskId} has cancel_requested_at set`, {
+          task_id: input.taskId,
+        });
+      }
+      if (fresh.state !== "waiting_human" || fresh.claim_id !== input.claimId) {
+        return fail(
+          "claim_lost",
+          `claim_id mismatch on record_human_reply for task ${input.taskId}`,
+          { task_id: input.taskId },
+        );
+      }
+      return fail("wrong_state", `task ${input.taskId} is in state ${fresh.state}`, {
+        task_id: input.taskId,
+        state: fresh.state,
+      });
+    }
+
+    deps.db
+      .query(
+        `INSERT INTO events (
+           task_id, attempt_id, event_type, from_state, to_state,
+           payload_artifact_id, occurred_at
+         ) VALUES (?, ?, 'human_reply_recorded', 'waiting_human', 'claimed-by-orchestrator', ?, ?)`,
+      )
+      .run(input.taskId, prior.attempt_id, artifact.artifactId, now);
+    deps.db.exec("COMMIT");
+  } catch (err) {
+    try {
+      deps.db.exec("ROLLBACK");
+    } catch {}
+    throw err;
+  }
+
+  await syncLinearState(deps.linear, row.external_ref, LINEAR_STATE_IN_PROGRESS);
+
+  return {
+    ok: true,
+    value: {
+      task_id: input.taskId,
+      state: "claimed-by-orchestrator",
+      artifact_id: artifactId,
     },
   };
 }

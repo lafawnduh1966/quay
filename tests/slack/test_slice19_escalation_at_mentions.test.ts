@@ -10,7 +10,12 @@ import { claim_task, escalate_human } from "../../src/core/claims.ts";
 import { tick_once } from "../../src/core/tick.ts";
 import { clearAllFailpoints, setFailpoint } from "../../src/core/failpoints.ts";
 import { createHarness, type Harness } from "../support/harness.ts";
-import { insertAttempt, insertRepo, insertTask } from "../support/fixtures.ts";
+import {
+  insertAttempt,
+  insertRepo,
+  insertTask,
+  markWaitingHumanLegacy,
+} from "../support/fixtures.ts";
 import { buildTickDeps } from "../support/tick_deps.ts";
 
 let h: Harness | null = null;
@@ -71,6 +76,7 @@ async function setupEscalation(opts: {
     },
   );
   if (!esc.ok) throw new Error("expected escalate");
+  markWaitingHumanLegacy(h.db, taskId);
 
   return {
     taskId,

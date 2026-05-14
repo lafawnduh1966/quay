@@ -7,7 +7,12 @@ import { afterEach, expect, test } from "bun:test";
 import { claim_task, escalate_human } from "../../src/core/claims.ts";
 import { tick_once } from "../../src/core/tick.ts";
 import { createHarness, type Harness } from "../support/harness.ts";
-import { insertAttempt, insertRepo, insertTask } from "../support/fixtures.ts";
+import {
+  insertAttempt,
+  insertRepo,
+  insertTask,
+  markWaitingHumanLegacy,
+} from "../support/fixtures.ts";
 import { buildTickDeps } from "../support/tick_deps.ts";
 
 let h: Harness | null = null;
@@ -57,6 +62,7 @@ test("test_048a_second_escalation_same_body_is_distinct", async () => {
   );
   if (!esc1.ok) throw new Error("expected escalate 1");
   expect(esc1.value.escalation_seq).toBe(1);
+  markWaitingHumanLegacy(h.db, taskId);
 
   await tick_once(built.deps); // post #1
   built.slack.appendHumanReply("C48a:0.1", "yes ship it");
@@ -86,6 +92,7 @@ test("test_048a_second_escalation_same_body_is_distinct", async () => {
     },
   );
   if (!esc2.ok) throw new Error("expected escalate 2");
+  markWaitingHumanLegacy(h.db, taskId);
 
   expect(esc2.value.escalation_seq).toBe(2);
   expect(esc2.value.escalation_nonce).not.toBe(esc1.value.escalation_nonce);

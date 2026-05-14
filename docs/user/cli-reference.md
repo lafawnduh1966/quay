@@ -196,7 +196,25 @@ quay escalate-human <task_id> \
   [--thread-ref <channel:ts>]
 ```
 
-If `--thread-ref` is omitted, the task must already have `slack_thread_ref`.
+This records the question and moves the task to `waiting_human` while
+preserving the orchestrator claim. Quay does not post to Slack; the
+orchestrator owns routing, posting, waiting, and fallback channels. If
+`--thread-ref` is omitted, the recorded thread metadata can remain empty.
+
+## Record Human Reply
+
+```bash
+quay record-human-reply <task_id> \
+  --claim-id <claim_id> \
+  --reply-file <path> \
+  [--thread-ref <channel:ts>] \
+  [--message-ts <ts>] \
+  [--author <name>]
+```
+
+This persists the human answer as a `slack_reply` artifact and returns the task
+to `claimed-by-orchestrator`, so the same orchestrator claim can call
+`submit-brief --reason advice_answered`.
 
 ## Cancel
 

@@ -162,6 +162,7 @@ export type TickAction =
   | "slack_post_recovered"
   | "slack_posted"
   | "slack_reply_ingested"
+  | "waiting_human_requeued"
   | "slack_skipped"
   | "tick_error";
 
@@ -512,6 +513,7 @@ function readClaimed(db: DB): ClaimedTaskRow[] {
 interface WaitingHumanTaskRow {
   task_id: string;
   slack_thread_ref: string | null;
+  claim_id: string | null;
   cancel_requested_at: string | null;
   authors_json: string | null;
   external_ref: string | null;
@@ -520,8 +522,8 @@ interface WaitingHumanTaskRow {
 function readWaitingHuman(db: DB): WaitingHumanTaskRow[] {
   return db
     .query<WaitingHumanTaskRow, []>(
-      `SELECT task_id, slack_thread_ref, cancel_requested_at, authors_json,
-              external_ref
+      `SELECT task_id, slack_thread_ref, claim_id, cancel_requested_at,
+              authors_json, external_ref
          FROM tasks
         WHERE state = 'waiting_human'
         ORDER BY created_at, task_id`,
@@ -2238,12 +2240,23 @@ async function processWaitingHumanTask(
   linearSyncs: LinearSyncQueue,
 ): Promise<TickTaskResult[]> {
   if (task.cancel_requested_at !== null) return [];
-  if (task.slack_thread_ref === null) {
-    // No thread to post into; nothing to do.
+  if (task.claim_id !== null) {
+    // New human-advice flow: the orchestrator owns Slack posting, waiting,
+    // reply capture, and follow-up brief submission while holding the claim.
     return [];
   }
 
   const art = loadLatestEscalationArtifact(deps.db, task.task_id);
+  if (task.slack_thread_ref === null) {
+    const migrated = requeueLegacyWaitingHumanWithoutThread(
+      deps,
+      task,
+      art,
+      linearSyncs,
+    );
+    return migrated === null ? [] : [migrated];
+  }
+
   if (!art || art.attempt_id === null || art.escalation_nonce === null) {
     return [];
   }
@@ -2280,7 +2293,10 @@ async function processWaitingHumanTask(
         const guard = deps.db
           .query<{ n: number }, [string]>(
             `SELECT 1 AS n FROM tasks
-              WHERE task_id = ? AND cancel_requested_at IS NULL`,
+              WHERE task_id = ?
+                AND state = 'waiting_human'
+                AND claim_id IS NULL
+                AND cancel_requested_at IS NULL`,
           )
           .get(task.task_id);
         if (!guard) {
@@ -2332,7 +2348,10 @@ async function processWaitingHumanTask(
       const guard = deps.db
         .query<{ n: number }, [string]>(
           `SELECT 1 AS n FROM tasks
-            WHERE task_id = ? AND cancel_requested_at IS NULL`,
+            WHERE task_id = ?
+              AND state = 'waiting_human'
+              AND claim_id IS NULL
+              AND cancel_requested_at IS NULL`,
         )
         .get(task.task_id);
       if (!guard) {
@@ -2385,6 +2404,68 @@ async function processWaitingHumanTask(
   ingestSlackReply(deps, task, art, firstNonBot, linearSyncs);
   results.push({ task_id: task.task_id, action: "slack_reply_ingested" });
   return results;
+}
+
+function requeueLegacyWaitingHumanWithoutThread(
+  deps: TickDeps,
+  task: WaitingHumanTaskRow,
+  art: EscalationArtifactRow | null,
+  linearSyncs: LinearSyncQueue,
+): TickTaskResult | null {
+  const now = deps.clock.nowISO();
+  deps.db.exec("BEGIN IMMEDIATE");
+  try {
+    const upd = deps.db
+      .query(
+        `UPDATE tasks
+            SET state = 'awaiting-next-brief',
+                tick_error = NULL,
+                updated_at = ?
+          WHERE task_id = ?
+            AND state = 'waiting_human'
+            AND claim_id IS NULL
+            AND slack_thread_ref IS NULL
+            AND cancel_requested_at IS NULL`,
+      )
+      .run(now, task.task_id);
+    const changed = (upd as { changes?: number }).changes ?? 0;
+    if (changed === 0) {
+      deps.db.exec("ROLLBACK");
+      return null;
+    }
+
+    const eventRow = deps.db
+      .query<{ event_id: number }, [string, number | null, string]>(
+        `INSERT INTO events (
+           task_id, event_type, from_state, to_state,
+           payload_artifact_id, occurred_at
+         ) VALUES (?, 'waiting_human_requeued', 'waiting_human', 'awaiting-next-brief', ?, ?)
+         RETURNING event_id`,
+      )
+      .get(task.task_id, art?.artifact_id ?? null, now);
+    if (!eventRow) throw new Error("waiting_human_requeued event insert returned no row");
+
+    enqueueOrchestratorHandoff(deps, {
+      taskId: task.task_id,
+      reason: "manual_resume",
+      stateEventId: eventRow.event_id,
+      payload: {
+        previous_state: "waiting_human",
+        reason: "missing_slack_thread_ref",
+        ...(art === null ? {} : { escalation_artifact_id: art.artifact_id }),
+      },
+    });
+
+    deps.db.exec("COMMIT");
+  } catch (err) {
+    try {
+      deps.db.exec("ROLLBACK");
+    } catch {}
+    throw err;
+  }
+
+  linearSyncs.enqueue(task.external_ref, LINEAR_STATE_IN_PROGRESS);
+  return { task_id: task.task_id, action: "waiting_human_requeued" };
 }
 
 // Bare Slack user-ID format, identical to the parser's check
@@ -2461,7 +2542,10 @@ function ingestSlackReply(
     const guard = deps.db
       .query<{ n: number }, [string]>(
         `SELECT 1 AS n FROM tasks
-          WHERE task_id = ? AND state = 'waiting_human' AND cancel_requested_at IS NULL`,
+          WHERE task_id = ?
+            AND state = 'waiting_human'
+            AND claim_id IS NULL
+            AND cancel_requested_at IS NULL`,
       )
       .get(task.task_id);
     if (!guard) {
@@ -2491,6 +2575,7 @@ function ingestSlackReply(
                 updated_at = ?
           WHERE task_id = ?
             AND state = 'waiting_human'
+            AND claim_id IS NULL
             AND cancel_requested_at IS NULL`,
       )
       .run(now, task.task_id);

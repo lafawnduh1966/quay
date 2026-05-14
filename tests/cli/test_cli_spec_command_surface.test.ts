@@ -246,7 +246,7 @@ test("submit-brief rejects unknown --reason values cleanly", async () => {
   expect(parsed.message).toContain("blocker_resolved");
 });
 
-test("escalate-human flag form persists artifact + transitions to waiting_human (no Slack call)", async () => {
+test("escalate-human flag form records question and preserves orchestrator claim", async () => {
   h = createHarness();
   const built = buildCliDeps(h);
 
@@ -291,9 +291,87 @@ test("escalate-human flag form persists artifact + transitions to waiting_human 
   expect(escalation.state).toBe("waiting_human");
   expect(escalation.thread_ref).toBe("C999:1700000099.0001");
 
-  // Per spec §5: the CLI must not have called Slack — tick is the only writer.
+  const task = h.db
+    .query<{ claim_id: string | null }, [string]>(
+      `SELECT claim_id FROM tasks WHERE task_id = ?`,
+    )
+    .get(taskId);
+  expect(task!.claim_id).toBe(claim_id);
+
+  // Slack transport is orchestrator-owned; the CLI only records artifacts/state.
   expect(built.slack.postCalls).toHaveLength(0);
   expect(built.slack.fenceCalls).toHaveLength(0);
+});
+
+test("record-human-reply flag form persists answer and returns to claimed state", async () => {
+  h = createHarness();
+  const built = buildCliDeps(h);
+
+  const repoId = insertRepo(h.db, "repo-reply-flag");
+  const taskId = insertTask(h.db, {
+    taskId: "task-reply-flag",
+    repoId,
+    state: "awaiting-next-brief",
+  });
+  insertAttempt(h.db, {
+    taskId,
+    attemptNumber: 1,
+    reason: "initial",
+    consumedBudget: 1,
+    spawnedAt: "2026-01-01T00:00:00.000Z",
+  });
+
+  const claimIo = bufferIO();
+  await dispatch(["task", "claim", taskId], built.deps, claimIo);
+  const { claim_id } = JSON.parse(claimIo.out());
+
+  const questionPath = writeTemp("Need human input", "q.md");
+  const escIo = bufferIO();
+  await dispatch(
+    [
+      "escalate-human",
+      taskId,
+      "--claim-id",
+      claim_id,
+      "--question-file",
+      questionPath,
+    ],
+    built.deps,
+    escIo,
+  );
+
+  const replyPath = writeTemp("Proceed with the fallback.", "reply.md");
+  const io = bufferIO();
+  const result = await dispatch(
+    [
+      "record-human-reply",
+      taskId,
+      "--claim-id",
+      claim_id,
+      "--reply-file",
+      replyPath,
+      "--thread-ref",
+      "C999:1700000099.0001",
+      "--message-ts",
+      "1700000101.0002",
+      "--author",
+      "U123",
+    ],
+    built.deps,
+    io,
+  );
+
+  expect(result.exitCode).toBe(0);
+  expect(io.err()).toBe("");
+  const reply = JSON.parse(io.out());
+  expect(reply.state).toBe("claimed-by-orchestrator");
+
+  const task = h.db
+    .query<{ state: string; claim_id: string | null }, [string]>(
+      `SELECT state, claim_id FROM tasks WHERE task_id = ?`,
+    )
+    .get(taskId);
+  expect(task).toEqual({ state: "claimed-by-orchestrator", claim_id });
 });
 
 test("task release-claim accepts --claim-id flag form", async () => {

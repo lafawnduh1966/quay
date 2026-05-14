@@ -10,7 +10,11 @@
 import { afterEach, expect, test } from "bun:test";
 import { join } from "node:path";
 import { cancel_task } from "../../src/core/cancel.ts";
-import { claim_task, escalate_human } from "../../src/core/claims.ts";
+import {
+  claim_task,
+  escalate_human,
+  record_human_reply,
+} from "../../src/core/claims.ts";
 import { resetLinearSyncWarnings } from "../../src/core/linear_state_sync.ts";
 import { tick_once } from "../../src/core/tick.ts";
 import { createHarness, type Harness } from "../support/harness.ts";
@@ -114,7 +118,7 @@ test("test_linear_sync_escalate_human_writes_waiting", async () => {
   ]);
 });
 
-test("test_linear_sync_slack_reply_ingest_writes_in_progress", async () => {
+test("test_linear_sync_record_human_reply_writes_in_progress", async () => {
   h = createHarness();
   h.clock.set("2026-05-11T10:00:00.000Z");
   const built = buildTickDeps(h);
@@ -134,7 +138,7 @@ test("test_linear_sync_slack_reply_ingest_writes_in_progress", async () => {
   });
 
   // Drive into waiting_human via escalate_human, then reset the call log so
-  // the slack-reply path is the only thing this assertion sees.
+  // the reply-recording path is the only thing this assertion sees.
   const claim = claim_task({ db: h.db, clock: h.clock }, { taskId });
   if (!claim.ok) throw new Error("expected claim");
   h.ids.push("abcdef12");
@@ -154,12 +158,24 @@ test("test_linear_sync_slack_reply_ingest_writes_in_progress", async () => {
   );
   if (!esc.ok) throw new Error("expected escalate");
 
-  // First tick: fence + bot post. Second tick: human reply lands, gets
-  // ingested, fires the writeback.
-  await tick_once(built.deps);
-  built.slack.appendHumanReply(threadRef, "all good, proceed");
   built.linear.resetSetIssueStateCalls();
-  await tick_once(built.deps);
+  const reply = await record_human_reply(
+    {
+      db: h.db,
+      clock: h.clock,
+      artifactStore: built.artifactStore,
+      linear: built.linear,
+    },
+    {
+      taskId,
+      claimId: claim.value.claim_id,
+      replyBody: "all good, proceed",
+      threadRef,
+      messageTs: "1.00000002",
+      author: "U123",
+    },
+  );
+  if (!reply.ok) throw new Error("expected reply record");
 
   expect(built.linear.setIssueStateCalls).toEqual([
     { identifier: "ENG-200", stateName: "In Progress" },

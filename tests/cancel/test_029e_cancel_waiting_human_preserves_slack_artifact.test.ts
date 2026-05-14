@@ -89,8 +89,7 @@ test("test_029e_cancel_waiting_human_preserves_slack_artifact", async () => {
   expect(artBefore).not.toBeNull();
   expect(existsSync(artBefore!.file_path)).toBe(true);
 
-  // Cancel from waiting_human. No Slack API call — Slack writer is tick-only,
-  // and cancel doesn't unpost.
+  // Cancel from waiting_human. No Slack API call, and cancel doesn't unpost.
   const slack = new FakeSlack();
   const result = await cancel_task(built.deps, { taskId });
   expect(result.ok).toBe(true);

@@ -92,8 +92,8 @@ binary and invalid UTF-8 artifacts such as `malformed_signal`.
 | `review_comments` | Snapshot of posted review body and inline comments. Used for review respawns and synthetic review forensics. |
 | `review_blocker` | Reviewer blocker or infrastructure-failure diagnostic. |
 | `conflict_slice` | Snapshot of merge-conflict observation. |
-| `slack_escalation_post` | Question body Quay posts to Slack. |
-| `slack_reply` | Human Slack reply ingested by tick. |
+| `slack_escalation_post` | Human question body recorded by `escalate-human`. |
+| `slack_reply` | Human Slack reply recorded by the orchestrator, or by legacy tick ingestion. |
 | `last_failure` | Would-be retry brief when retry budget is exhausted. |
 
 ## Tick Errors

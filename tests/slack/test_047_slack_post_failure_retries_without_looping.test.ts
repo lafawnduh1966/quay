@@ -6,7 +6,12 @@ import { afterEach, expect, test } from "bun:test";
 import { claim_task, escalate_human } from "../../src/core/claims.ts";
 import { tick_once } from "../../src/core/tick.ts";
 import { createHarness, type Harness } from "../support/harness.ts";
-import { insertAttempt, insertRepo, insertTask } from "../support/fixtures.ts";
+import {
+  insertAttempt,
+  insertRepo,
+  insertTask,
+  markWaitingHumanLegacy,
+} from "../support/fixtures.ts";
 import { buildTickDeps } from "../support/tick_deps.ts";
 
 let h: Harness | null = null;
@@ -51,6 +56,7 @@ test("test_047_slack_post_failure_retries_without_looping", async () => {
     },
   );
   if (!esc.ok) throw new Error("expected escalate");
+  markWaitingHumanLegacy(h.db, taskId);
 
   // Tick #1: Slack API throws. Tick logs tick_error and skips. No tight
   // loop: exactly one post attempt within this tick.

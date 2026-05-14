@@ -107,8 +107,9 @@ quay escalate-human <task_id> --claim-id <claim_id> --question-file ./question.m
 quay cancel <task_id>
 ```
 
-`submit-brief --reason advice_answered` is allowed because it does not consume
-retry budget.
+After asking a human, use `record-human-reply` to persist the answer, then
+`submit-brief --reason advice_answered`; that reason is allowed because it does
+not consume retry budget.
 
 ## `worktree_error`
 
@@ -129,9 +130,31 @@ quay cancel <task_id> --keep-worktree
 ## `orchestrator_loop`
 
 The task was claimed repeatedly and the claims expired repeatedly. Inspect the
-orchestrator process that owns `task claim` / `submit-brief` / `escalate-human`.
+orchestrator process that owns `task claim` / `submit-brief` /
+`escalate-human` / `record-human-reply`.
 
 Manual recovery is cancellation.
+
+## Stale `waiting_human` Claim
+
+Human waits can legitimately outlive the normal claim timeout, so tick does not
+auto-release `waiting_human` rows that still have a `claim_id`.
+
+Inspect claimed handoffs:
+
+```bash
+quay handoff list --status claimed
+quay task get <task_id>
+```
+
+If the owning orchestrator is known dead, use the `claim_id` from the handoff
+row to reopen the handoff:
+
+```bash
+quay task release-claim <task_id> --claim-id <claim_id>
+```
+
+The task returns to `awaiting-next-brief`, and another orchestrator can claim it.
 
 ## `non_budget_loop`
 

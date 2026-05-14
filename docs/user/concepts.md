@@ -86,7 +86,7 @@ Common active states:
 - `done`: CI passed, but the PR is still open. This is not terminal.
 - `awaiting-next-brief`: Quay needs orchestrator input.
 - `claimed-by-orchestrator`: an orchestrator has claimed the task.
-- `waiting_human`: Quay is waiting for a Slack reply.
+- `waiting_human`: an orchestrator-owned human question is awaiting an answer.
 
 Parked states:
 

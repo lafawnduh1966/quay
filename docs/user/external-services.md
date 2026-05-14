@@ -93,8 +93,11 @@ Slack is used for two paths:
 
 - `quay enqueue --linear-issue` can fetch the source thread and include it in
   the worker brief.
-- `quay tick` posts escalation questions and reads human replies for tasks in
-  `waiting_human`.
+- The orchestrator can use Slack for human questions, then record the answer
+  through `quay record-human-reply`.
+
+Claimless legacy `waiting_human` tasks with an existing `slack_thread_ref` can
+still be completed by the old tick-owned Slack post/reply path.
 
 ### Create And Install A Slack App
 
