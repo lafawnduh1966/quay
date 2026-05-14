@@ -1032,7 +1032,7 @@ No `--json` flag exists or is needed; JSON is the only output format. The pull-l
 
 | Command | Purpose |
 |---|---|
-| `quay task get <id>` | Full task state, current attempt, recent events. |
+| `quay task get <id>` | Full task state, `slack_thread_ref`, current attempt, recent events. |
 | `quay task list [--state <s>]... [--repo <id>] [--external-ref <ref>]` | Filtered list. `--state` is repeatable for OR-filtering across states (e.g. `--state awaiting-next-brief --state waiting_human`). Output is a single JSON array on stdout, with one task object per element. Empty result is `[]`. |
 | `quay task events <id>` | Append-only event log for a task. |
 | `quay artifact get <task_id> <kind> [--attempt <n>]` | Fetch artifact contents (or path with `--path`). |
@@ -1554,7 +1554,7 @@ The v1 test suite must cover the following cases. Each is a state-machine integr
 ### Read-command JSON shape
 
 70. **`task list` with no matches returns `[]`.** Asserts: literal empty JSON array on stdout.
-71. **`task get` returns a single object, not an array.** Asserts: stdout starts with `{`.
+71. **`task get` returns a single object, not an array.** Asserts: stdout starts with `{` and includes `slack_thread_ref` for orchestrator Slack routing.
 72. **`tick` emits NDJSON, one task per line.** Asserts: each line independently parses as a JSON object.
 
 ### PR idempotency and per-attempt SHA tracking

@@ -34,6 +34,7 @@ export interface TaskGetEvent {
 }
 
 export interface TaskGetPayload extends TaskListRow {
+  slack_thread_ref: string | null;
   pr_number: number | null;
   pr_url: string | null;
   head_sha: string | null;
@@ -86,6 +87,7 @@ export function listTasks(db: DB): TaskListRow[] {
 }
 
 interface TaskGetRawRow extends TaskListRawRow {
+  slack_thread_ref: string | null;
   pr_number: number | null;
   pr_url: string | null;
   head_sha: string | null;
@@ -97,7 +99,7 @@ const RECENT_EVENT_LIMIT = 20;
 export function getTask(db: DB, taskId: string): TaskGetPayload | null {
   const row = db
     .query<TaskGetRawRow, [string]>(
-      `SELECT ${TASK_LIST_COLUMNS}, pr_number, pr_url, head_sha, base_sha
+      `SELECT ${TASK_LIST_COLUMNS}, slack_thread_ref, pr_number, pr_url, head_sha, base_sha
          FROM tasks WHERE task_id = ?`,
     )
     .get(taskId);
@@ -126,6 +128,7 @@ export function getTask(db: DB, taskId: string): TaskGetPayload | null {
 
   return {
     ...rowToList(row),
+    slack_thread_ref: row.slack_thread_ref,
     pr_number: row.pr_number,
     pr_url: row.pr_url,
     head_sha: row.head_sha,

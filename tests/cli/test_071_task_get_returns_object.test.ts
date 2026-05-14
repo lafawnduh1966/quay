@@ -19,6 +19,9 @@ test("test_071_task_get_returns_object", async () => {
   h = createHarness();
   const repoId = insertRepo(h.db, "repo-get");
   const taskId = insertTask(h.db, { taskId: "task-get", repoId, state: "queued" });
+  h.db
+    .query(`UPDATE tasks SET slack_thread_ref = ? WHERE task_id = ?`)
+    .run("GPRIVATE123:999.000000", taskId);
   insertAttempt(h.db, {
     taskId,
     attemptNumber: 1,
@@ -49,6 +52,7 @@ test("test_071_task_get_returns_object", async () => {
   expect(parsed.task_id).toBe(taskId);
   expect(parsed.state).toBe("queued");
   expect(parsed.repo_id).toBe(repoId);
+  expect(parsed.slack_thread_ref).toBe("GPRIVATE123:999.000000");
   // Current attempt is the most recent attempt row for this task.
   expect(parsed.current_attempt).toBeDefined();
   expect(parsed.current_attempt.attempt_number).toBe(1);
