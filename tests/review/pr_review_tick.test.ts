@@ -96,6 +96,98 @@ test("CI-green pr-open task enters pr-review when reviewer gate is enabled", asy
   expect(reviewAttempt).toEqual({ reason: "review_only", head_sha: "head-99" });
 });
 
+test("review prompt omits stale generated PR target after task base branch repair", async () => {
+  h = createHarness();
+  const built = buildTickDeps(h);
+  const repoId = insertRepo(h.db, "repo-base-repair-review");
+  const taskId = insertTask(h.db, {
+    repoId,
+    taskId: "task-base-repair-review",
+    state: "pr-open",
+  });
+  seedTaskObjective(h, taskId, "Implement the repaired-base task.");
+  h.db
+    .query(`UPDATE tasks SET base_branch = 'main' WHERE task_id = ?`)
+    .run(taskId);
+  h.db
+    .query(`UPDATE tasks SET base_branch = 'dev' WHERE task_id = ?`)
+    .run(taskId);
+  const attemptId = insertAttempt(h.db, {
+    taskId,
+    spawnedAt: "2026-01-01T00:00:00.000Z",
+  });
+  const store = createArtifactStore({
+    db: h.db,
+    artifactRoot: h.artifactRoot,
+    clock: h.clock,
+  });
+  store.writeArtifact({
+    taskId,
+    attemptId,
+    kind: "brief",
+    content: [
+      "<quay-task-objective>",
+      "Implement the repaired-base task.",
+      "</quay-task-objective>",
+      "",
+      '<quay-pr-target base-branch="main">',
+      "Open or update the pull request against base branch main.",
+      "</quay-pr-target>",
+    ].join("\n"),
+    extension: "md",
+  });
+  built.github.setPrSnapshot(repoId, `quay/${taskId}`, {
+    prNumber: 100,
+    state: "open",
+    headSha: "head-100",
+    baseSha: "base-dev",
+    baseRef: "dev",
+    mergeable: "mergeable",
+    latestReview: { decision: "NONE", latestReviewId: null, comments: "" },
+    checks: {
+      checkSha: "head-100",
+      items: [{ name: "build", workflow: null, bucket: "pass", required: true }],
+    },
+  });
+  built.github.setPrView(repoId, 100, {
+    number: 100,
+    title: "Base repair PR",
+    body: "",
+    url: "https://example.test/pr/100",
+    headRefName: `quay/${taskId}`,
+    headSha: "head-100",
+  });
+
+  const results = await tick_once(
+    built.deps,
+    reviewerTickOptions({ gateQuayOwnedDone: true }),
+  );
+
+  expect(results).toContainEqual({ task_id: taskId, action: "review_requested" });
+  const reviewerAttempt = h.db
+    .query<{ attempt_id: number }, [string]>(
+      `SELECT attempt_id FROM attempts
+        WHERE task_id = ? AND reason = 'review_only' AND head_sha = 'head-100'
+        ORDER BY attempt_id DESC LIMIT 1`,
+    )
+    .get(taskId);
+  expect(reviewerAttempt).not.toBeNull();
+  const promptRow = h.db
+    .query<{ file_path: string }, [string, number]>(
+      `SELECT file_path FROM artifacts
+        WHERE task_id = ? AND attempt_id = ? AND kind = 'final_prompt'
+        ORDER BY artifact_id DESC LIMIT 1`,
+    )
+    .get(taskId, reviewerAttempt!.attempt_id);
+  expect(promptRow).not.toBeNull();
+  const prompt = readFileSync(promptRow!.file_path, "utf8");
+  expect(prompt).toContain("Base branch: dev");
+  expect(prompt).not.toContain('base-branch="main"');
+  expect(prompt).not.toContain("Open or update the pull request against base branch main.");
+  expect(prompt).toContain("Review target and Required action above are authoritative");
+  expect(prompt).toContain("Implement the repaired-base task.");
+});
+
 test("tick spawns pending review attempts without moving task to running", async () => {
   h = createHarness();
   const built = buildTickDeps(h);
@@ -375,7 +467,7 @@ test("review after CHANGES_REQUESTED respawn gets reviewer-specific prompt", asy
     taskId: "task-review-respawn-prompt",
     state: "pr-open",
   });
-  seedTaskObjective(h, taskId);
+  seedTaskObjective(h, taskId, "original ticket context");
   const store = createArtifactStore({
     db: h.db,
     artifactRoot: h.artifactRoot,
@@ -414,7 +506,7 @@ test("review after CHANGES_REQUESTED respawn gets reviewer-specific prompt", asy
         WHERE attempt_id = ?`,
     )
     .run(reviewAttemptId);
-  store.writeArtifact({
+  const reviewCommentsArtifact = store.writeArtifact({
     taskId,
     attemptId: reviewAttemptId,
     kind: "review_comments",
@@ -462,6 +554,14 @@ test("review after CHANGES_REQUESTED respawn gets reviewer-specific prompt", asy
       "The pull request has new review feedback marked CHANGES_REQUESTED. Read the snapshotted comments, address each one, push the branch, and update the existing PR.",
     extension: "md",
   });
+  h.db
+    .query(
+      `INSERT INTO events (
+         task_id, attempt_id, event_type, from_state, to_state,
+         payload_artifact_id, occurred_at
+       ) VALUES (?, ?, 'changes_requested', 'pr-review', 'queued', ?, ?)`,
+    )
+    .run(taskId, respawnAttemptId, reviewCommentsArtifact.artifactId, h.clock.nowISO());
 
   built.github.setPrSnapshot(repoId, `quay/${taskId}`, {
     prNumber: 11,
@@ -526,7 +626,7 @@ test("review after conflict respawn does not reuse the worker conflict brief", a
     taskId: "task-conflict-review-prompt",
     state: "pr-open",
   });
-  seedTaskObjective(h, taskId);
+  seedTaskObjective(h, taskId, "original ticket context for conflict repair");
   const store = createArtifactStore({
     db: h.db,
     artifactRoot: h.artifactRoot,
