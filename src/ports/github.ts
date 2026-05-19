@@ -12,6 +12,16 @@
 // plain-text `gh pr checks ...` output.
 export interface GitHubPort {
   prExistsForBranch(repoId: string, branch: string): boolean;
+  // Exact reconciliation read for a dead worker that reports an already-open
+  // PR before Quay has attached PR metadata to the task row. The adapter must
+  // filter by both head branch and base branch, and return only currently open
+  // PRs so the classifier can reject ambiguous matches instead of retrying as
+  // generic no-progress.
+  openPrsForBranchBase(
+    repoId: string,
+    branch: string,
+    baseBranch: string,
+  ): OpenBranchPr[];
   prCheckStatus(repoId: string, branch: string): PrCheckStatus;
   // Returns true iff a PR for the branch is currently open. Used by the cancel
   // finalizer to decide whether to retain the remote branch in the default
@@ -123,6 +133,14 @@ export interface PrSnapshot {
   mergeable: PrMergeableState;
   latestReview: PrLatestReview;
   checks: PrChecksReport;
+}
+
+export interface OpenBranchPr {
+  number: number;
+  url: string | null;
+  headSha: string;
+  baseSha: string | null;
+  baseRef: string | null;
 }
 
 export interface PullRequestView {

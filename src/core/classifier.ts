@@ -14,7 +14,7 @@ import type { ArtifactStore } from "../artifacts/store.ts";
 import type { DB } from "../db/connection.ts";
 import type { Clock } from "../ports/clock.ts";
 import type { GitPort } from "../ports/git.ts";
-import type { GitHubPort } from "../ports/github.ts";
+import type { GitHubPort, OpenBranchPr } from "../ports/github.ts";
 import type { PaneExitInfo, TmuxPort } from "../ports/tmux.ts";
 import { EXIT_INFO_NONE } from "./exit_status.ts";
 import { fireFailpoint } from "./failpoints.ts";
@@ -64,6 +64,7 @@ export type ClassifyOutcome =
   | "goal_report_processed"
   | "malformed_signal"
   | "pr_opened"
+  | "existing_pr_attached"
   | "no_progress"
   | "crashed"
   | "spawn_window_no_evidence";
@@ -72,6 +73,7 @@ export interface ClassifyContextTask {
   task_id: string;
   repo_id: string;
   branch_name: string;
+  pr_number: number | null;
   tmux_id: string;
   worktree_path: string;
   state: string;
@@ -269,6 +271,17 @@ export function classifyAndApply(
     return transitionPrOpened(deps, task, attempt, remoteShaAtExit, exitInfo);
   }
   if (prExistsAtExit && noProgress) {
+    if (task.pr_number === null) {
+      const attached = reconcileExistingOpenPr(
+        deps,
+        task,
+        attempt,
+        remoteShaAtExit,
+        exitInfo,
+        predicate,
+      );
+      if (attached !== null) return attached;
+    }
     return scheduleNoProgressRetry(
       deps,
       task,
@@ -1859,6 +1872,148 @@ function ingestMalformed(
     rmSync(blockerPath, { force: true });
   } catch {}
   return { outcome: "malformed_signal" };
+}
+
+function reconcileExistingOpenPr(
+  deps: ClassifierDeps,
+  task: ClassifyContextTask,
+  attempt: ClassifyContextAttempt,
+  remoteShaAtExit: string | null,
+  exitInfo: PaneExitInfo,
+  predicate: PredicateState,
+): ClassifyResult | null {
+  const baseBranch = task.base_branch?.trim();
+  if (baseBranch === undefined || baseBranch.length === 0) return null;
+
+  let matches: OpenBranchPr[];
+  try {
+    matches = deps.github.openPrsForBranchBase(
+      task.repo_id,
+      task.branch_name,
+      baseBranch,
+    );
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(
+      `existing PR reconciliation lookup failed for ${task.repo_id} ${task.branch_name} -> ${baseBranch}: ${message}`,
+    );
+  }
+
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    const prList = matches.map((pr) => `#${pr.number}`).join(", ");
+    throw new Error(
+      `existing PR reconciliation found multiple open PRs for ${task.repo_id} ${task.branch_name} -> ${baseBranch}: ${prList}`,
+    );
+  }
+
+  return transitionExistingPrAttached(
+    deps,
+    task,
+    attempt,
+    remoteShaAtExit,
+    exitInfo,
+    predicate,
+    baseBranch,
+    matches[0]!,
+  );
+}
+
+function transitionExistingPrAttached(
+  deps: ClassifierDeps,
+  task: ClassifyContextTask,
+  attempt: ClassifyContextAttempt,
+  remoteShaAtExit: string | null,
+  exitInfo: PaneExitInfo,
+  predicate: PredicateState,
+  baseBranch: string,
+  pr: OpenBranchPr,
+): ClassifyResult {
+  const now = deps.clock.nowISO();
+  const headSha = pr.headSha === "" ? null : pr.headSha;
+  deps.db.exec("BEGIN");
+  try {
+    const taskUpd = deps.db
+      .query(
+        `UPDATE tasks
+            SET state = 'pr-open',
+                pr_number = ?,
+                pr_url = COALESCE(?, pr_url),
+                head_sha = COALESCE(?, head_sha),
+                base_sha = COALESCE(?, base_sha),
+                spawn_failures_consecutive = 0,
+                tick_error = NULL,
+                updated_at = ?
+          WHERE task_id = ?
+            AND state = 'running'
+            AND pr_number IS NULL
+            AND cancel_requested_at IS NULL`,
+      )
+      .run(
+        pr.number,
+        pr.url,
+        headSha,
+        pr.baseSha,
+        now,
+        task.task_id,
+      );
+    const changes = (taskUpd as { changes?: number }).changes ?? 0;
+    if (changes === 0) {
+      deps.db.exec("ROLLBACK");
+      return { outcome: "existing_pr_attached" };
+    }
+    deps.db
+      .query(
+        `UPDATE attempts
+            SET exit_kind = 'pr_opened',
+                ended_at = ?,
+                remote_sha_at_exit = ?,
+                exit_code = ?,
+                exit_signal = ?
+          WHERE attempt_id = ?`,
+      )
+      .run(
+        now,
+        remoteShaAtExit,
+        exitInfo.exitCode,
+        exitInfo.exitSignal,
+        attempt.attempt_id,
+      );
+    const eventData = JSON.stringify({
+      reason: "existing_open_pr_for_task_branch_base",
+      pr_number: pr.number,
+      pr_url: pr.url,
+      head_sha: headSha,
+      base_sha: pr.baseSha,
+      branch_name: task.branch_name,
+      base_branch: baseBranch,
+      pr_base_ref: pr.baseRef,
+      remote_sha_at_spawn: attempt.remote_sha_at_spawn,
+      remote_sha_at_exit: remoteShaAtExit,
+      remote_unchanged: predicate.remoteUnchanged,
+      pr_existed_at_spawn: predicate.prExistedAtSpawn,
+      pr_exists_at_exit: predicate.prExistsAtExit,
+      exit_code: exitInfo.exitCode,
+      exit_signal: exitInfo.exitSignal,
+    });
+    deps.db
+      .query(
+        `INSERT INTO events (
+           task_id, attempt_id, event_type,
+           from_state, to_state, occurred_at, event_data
+         ) VALUES (?, ?, 'existing_pr_attached', 'running', 'pr-open', ?, ?)`,
+      )
+      .run(task.task_id, attempt.attempt_id, now, eventData);
+    deps.db.exec("COMMIT");
+  } catch (err) {
+    try {
+      deps.db.exec("ROLLBACK");
+    } catch {}
+    throw err;
+  }
+
+  captureDiffSummary(deps, task, attempt, remoteShaAtExit);
+  return { outcome: "existing_pr_attached" };
 }
 
 function transitionPrOpened(

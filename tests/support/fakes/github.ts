@@ -1,5 +1,6 @@
 import type {
   GitHubPort,
+  OpenBranchPr,
   PostedReview,
   PrCheckStatus,
   PrSnapshot,
@@ -10,6 +11,7 @@ export class FakeGitHub implements GitHubPort {
   readonly calls: { repoId: string; branch: string }[] = [];
   readonly closePrCalls: { repoId: string; branch: string }[] = [];
   readonly prExisting = new Map<string, boolean>(); // key = `${repoId}\0${branch}`
+  readonly openPrsByBranchBase = new Map<string, OpenBranchPr[]>();
   readonly prOpen = new Map<string, boolean>();
   readonly checkStatuses = new Map<string, PrCheckStatus>();
   // Explicit per-(repo, branch) PR snapshots take precedence over the legacy
@@ -28,6 +30,25 @@ export class FakeGitHub implements GitHubPort {
 
   setPrExists(repoId: string, branch: string, exists: boolean): void {
     this.prExisting.set(`${repoId}\0${branch}`, exists);
+  }
+
+  openPrsForBranchBase(
+    repoId: string,
+    branch: string,
+    baseBranch: string,
+  ): OpenBranchPr[] {
+    return [
+      ...(this.openPrsByBranchBase.get(`${repoId}\0${branch}\0${baseBranch}`) ?? []),
+    ];
+  }
+
+  setOpenPrsForBranchBase(
+    repoId: string,
+    branch: string,
+    baseBranch: string,
+    prs: OpenBranchPr[],
+  ): void {
+    this.openPrsByBranchBase.set(`${repoId}\0${branch}\0${baseBranch}`, [...prs]);
   }
 
   prCheckStatus(repoId: string, branch: string): PrCheckStatus {

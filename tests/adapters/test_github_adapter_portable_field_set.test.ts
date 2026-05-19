@@ -186,3 +186,59 @@ test("baseSha falls back to null when git merge-base fails (e.g. unfetched base)
   expect(snap!.prNumber).toBe(99);
   expect(snap!.headSha).toBe("head-z");
 });
+
+test("open PR reconciliation lookup filters by head and base", () => {
+  const adapter = new RecordingAdapter();
+  adapter.responder = (cmd) => {
+    if (cmd[0] === "gh" && cmd[1] === "pr" && cmd[2] === "list") {
+      return { exitCode: 0, stdout: JSON.stringify([{ number: 42 }]), stderr: "" };
+    }
+    if (cmd[0] === "gh" && cmd[1] === "pr" && cmd[2] === "view") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          number: 42,
+          url: "https://github.com/example/repo/pull/42",
+          state: "OPEN",
+          headRefOid: "head-42",
+          baseRefName: "main",
+          mergeable: "MERGEABLE",
+          reviewDecision: "NONE",
+          latestReviews: [],
+        }),
+        stderr: "",
+      };
+    }
+    if (cmd[0] === "git" && cmd[1] === "merge-base") {
+      return { exitCode: 0, stdout: "base-42\n", stderr: "" };
+    }
+    if (cmd[0] === "git" && cmd[1] === "rev-parse") {
+      return { exitCode: 0, stdout: "base-tip-42\n", stderr: "" };
+    }
+    throw new Error(`unexpected cmd ${JSON.stringify(cmd)}`);
+  };
+
+  const prs = adapter.openPrsForBranchBase("repo-x", "quay/feat", "main");
+  expect(prs).toEqual([
+    {
+      number: 42,
+      url: "https://github.com/example/repo/pull/42",
+      headSha: "head-42",
+      baseSha: "base-42",
+      baseRef: "main",
+    },
+  ]);
+  expect(adapter.cmds[0]).toEqual([
+    "gh",
+    "pr",
+    "list",
+    "--head",
+    "quay/feat",
+    "--state",
+    "open",
+    "--base",
+    "main",
+    "--json",
+    "number",
+  ]);
+});

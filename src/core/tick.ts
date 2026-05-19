@@ -150,6 +150,7 @@ export type TickAction =
   | "goal_budget_limited"
   | "malformed_signal"
   | "pr_opened"
+  | "existing_pr_attached"
   | "no_progress"
   | "crashed"
   | "spawn_window_recovered"
@@ -207,6 +208,7 @@ interface RunningTaskRow {
   base_branch: string | null;
   tmux_id: string;
   worktree_path: string;
+  pr_number: number | null;
   cancel_requested_at: string | null;
   worker_execution: "oneshot" | "goal";
 }
@@ -745,7 +747,7 @@ function readRunning(db: DB): RunningTaskRow[] {
       `SELECT t.task_id, t.repo_id, t.branch_name,
               COALESCE(t.base_branch, r.base_branch) AS base_branch,
               t.tmux_id, t.worktree_path,
-              t.cancel_requested_at, t.worker_execution
+              t.pr_number, t.cancel_requested_at, t.worker_execution
          FROM tasks t JOIN repos r ON r.repo_id = t.repo_id
         WHERE t.state = 'running'
         ORDER BY t.created_at, t.task_id`,
@@ -960,6 +962,7 @@ function processRunningTask(
     repo_id: task.repo_id,
     branch_name: task.branch_name,
     base_branch: task.base_branch,
+    pr_number: task.pr_number,
     tmux_id: task.tmux_id,
     worktree_path: task.worktree_path,
     state: "running",
@@ -1152,6 +1155,8 @@ function outcomeToResult(
       return { task_id: taskId, action: "malformed_signal" };
     case "pr_opened":
       return { task_id: taskId, action: "pr_opened" };
+    case "existing_pr_attached":
+      return { task_id: taskId, action: "existing_pr_attached" };
     case "no_progress":
       return { task_id: taskId, action: "no_progress" };
     case "crashed":

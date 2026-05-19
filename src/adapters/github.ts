@@ -6,6 +6,7 @@
 //
 // Schema mapping (see ports/github.ts for the type definitions):
 //   - PR existence:       `gh pr list --head <branch> --state all --json number`
+//   - Open PR reconcile:  `gh pr list --head <branch> --base <base> --state open --json number`
 //   - PR open?:           `gh pr list --head <branch> --state open --json number`
 //   - PR snapshot fields: `gh pr view <branch> --json number,url,state,isDraft,headRefOid,
 //                                                baseRefName,mergeable,
@@ -35,6 +36,7 @@
 import { join, resolve } from "node:path";
 import type {
   GitHubPort,
+  OpenBranchPr,
   PrCheck,
   PrCheckBucket,
   PrCheckStatus,
@@ -62,6 +64,34 @@ export class GitHubCliAdapter implements GitHubPort {
   prExistsForBranch(repoId: string, branch: string): boolean {
     const list = this.listPrs(repoId, branch, "all");
     return list.length > 0;
+  }
+
+  openPrsForBranchBase(
+    repoId: string,
+    branch: string,
+    baseBranch: string,
+  ): OpenBranchPr[] {
+    return this.listPrs(repoId, branch, "open", baseBranch).map((pr) => {
+      const number = toFiniteIntegerOrNull(pr.number);
+      if (number === null) {
+        throw new Error(
+          `gh pr list returned an open PR without a numeric number for ${branch} -> ${baseBranch}`,
+        );
+      }
+      const view = this.fetchPrView(repoId, String(number));
+      if (view === null) {
+        throw new Error(
+          `gh pr view returned no PR for listed open PR #${number}`,
+        );
+      }
+      return {
+        number: view.prNumber ?? number,
+        url: view.prUrl ?? null,
+        headSha: view.headSha,
+        baseSha: view.baseSha,
+        baseRef: view.baseRef ?? null,
+      };
+    });
   }
 
   prCheckStatus(repoId: string, branch: string): PrCheckStatus {
@@ -311,8 +341,9 @@ export class GitHubCliAdapter implements GitHubPort {
     repoId: string,
     branch: string,
     state: "open" | "closed" | "all",
+    baseBranch?: string,
   ): Array<{ number: number }> {
-    const result = this.run(repoId, [
+    const args = [
       "gh",
       "pr",
       "list",
@@ -320,12 +351,15 @@ export class GitHubCliAdapter implements GitHubPort {
       branch,
       "--state",
       state,
-      "--json",
-      "number",
-    ]);
+    ];
+    if (baseBranch !== undefined) {
+      args.push("--base", baseBranch);
+    }
+    args.push("--json", "number");
+    const result = this.run(repoId, args);
     if (result.exitCode !== 0) {
       throw new Error(
-        `gh pr list --head ${branch} --state ${state} failed: ${result.stderr.trim()}`,
+        `gh pr list --head ${branch}${baseBranch !== undefined ? ` --base ${baseBranch}` : ""} --state ${state} failed: ${result.stderr.trim()}`,
       );
     }
     let parsed: unknown;
